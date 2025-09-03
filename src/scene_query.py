@@ -2,17 +2,18 @@
 # render_layer_tool/scene_query.py
 from __future__ import annotations
 import maya.cmds as cmds
-# --- 修正: 相対インポートから直接インポートに変更 ---
-from rs_utils import _ensure_mtoa_loaded, logger
+import rs_utils
 
 def get_raw_selection():
-    """現在選択の transform (long path) を返す"""
+    """現在の選択をtransformとして返す。"""
     return cmds.ls(sl=True, long=True, type="transform") or []
 
 def _get_node_type(node_path: str):
-    _ensure_mtoa_loaded()
+    """ノードのタイプと子の有無を判定する。"""
     shapes = cmds.listRelatives(node_path, shapes=True, noIntermediate=True, fullPath=True) or []
-    info = {"type": "group", "primaryVisibility": None}
+    children = cmds.listRelatives(node_path, children=True, type='transform', fullPath=True) or []
+    info = {"type": "group" if children or not shapes else "other"}
+
     if not shapes:
         return info
 
@@ -27,82 +28,112 @@ def _get_node_type(node_path: str):
             if not cmds.camera(node_path, q=True, startupCamera=True):
                 info["type"] = "camera"
                 return info
-            else:
-                return None # スタートアップカメラは無視
-        except Exception:
-            return None
+        except Exception: pass
+        return None 
 
-    is_light = "light" in inh or "aiLight" in inh
-    if not is_light and cmds.nodeType(shp) in ("aiAreaLight", "aiSkyDomeLight", "aiMeshLight", "aiPhotometricLight"):
-        is_light = True
-    if is_light:
+    if "light" in inh or "aiLight" in inh:
         info["type"] = "light"
         return info
-
+    
     if "locator" in inh:
         info["type"] = "other"
         return info
 
-    info["type"] = "geometry"
-    if cmds.attributeQuery("primaryVisibility", node=shp, exists=True):
-        try: info["primaryVisibility"] = cmds.getAttr(f"{shp}.primaryVisibility")
-        except Exception: pass
+    if 'geometry' in inh or cmds.nodeType(shp) == 'mesh':
+        info["type"] = "geometry"
+
     return info
 
-def get_scene_hierarchy():
-    logger.debug("Building scene hierarchy.")
+def get_categorized_scene_hierarchy():
+    """UIツリー用にカテゴリ分けされた階層データを構築する。"""
+    rs_utils.logger.debug("Building categorized scene hierarchy...")
     roots = cmds.ls(assemblies=True, long=True) or []
-    hierarchy = {}
+    
+    categorized_hierarchy = {
+        "geometry": {},
+        "lights": {},
+        "cameras": {},
+        "groups": {},
+        "other": {}
+    }
 
-    def build(n):
-        inf = _get_node_type(n)
-        if inf is None: return None
-        data = {"type": inf["type"], "primaryVisibility": inf["primaryVisibility"], "children": {}}
-        kids = cmds.listRelatives(n, children=True, type="transform", fullPath=True) or []
-        for ch in kids:
-            s = build(ch)
-            if s: data["children"][ch] = s
-        return data
+    def build_and_categorize(node_path):
+        node_info = _get_node_type(node_path)
+        if node_info is None: return None
 
-    ignore = {"|persp", "|top", "|front", "|side"}
-    for n in roots:
-        if n in ignore: continue
-        d = build(n)
-        if d: hierarchy[n] = d
+        node_data = {"type": node_info["type"], "children": {}}
+        
+        children = cmds.listRelatives(node_path, children=True, type="transform", fullPath=True) or []
+        for child in children:
+            child_data = build_and_categorize(child)
+            if child_data:
+                node_data["children"][child] = child_data
+        
+        return node_data
 
-    logger.debug("Hierarchy building complete.")
-    return hierarchy
+    ignore = {"|persp", "|top", "|front", "|side", "|defaultLightSet", "|defaultObjectSet"}
+    for root_node in roots:
+        if root_node in ignore: continue
+        
+        root_data = build_and_categorize(root_node)
+        if root_data:
+            category_map = {
+                "geometry": "geometry",
+                "light": "lights",
+                "camera": "cameras",
+                "group": "groups",
+                "other": "other"
+            }
+            category = category_map.get(root_data["type"], "other")
+            categorized_hierarchy[category][root_node] = root_data
+
+    rs_utils.logger.debug("Categorized hierarchy build complete.")
+    return categorized_hierarchy
 
 def get_renderable_descendants(root_node: str):
-    """root_node 配下のレンダリング可能 transform を列挙"""
+    """指定ノード配下のレンダリング可能なジオメトリを列挙する。"""
     out = set()
-    def is_geom(node: str):
+    def is_geom(node: str) -> bool:
         s = cmds.listRelatives(node, shapes=True, noIntermediate=True, fullPath=True) or []
         if not s: return False
         try:
             inh = cmds.nodeType(s[0], inherited=True) or []
-        except Exception: inh = []
-        return "camera" not in inh and "light" not in inh and "aiLight" not in inh
+            return "camera" not in inh and "light" not in inh and "aiLight" not in inh
+        except Exception:
+            return False
 
-    if is_geom(root_node): out.add(root_node)
-    for ch in cmds.listRelatives(root_node, allDescendents=True, type="transform", fullPath=True) or []:
-        if is_geom(ch): out.add(ch)
+    if is_geom(root_node):
+        out.add(root_node)
+
+    descendants = cmds.listRelatives(root_node, allDescendents=True, type="transform", fullPath=True) or []
+    for ch in descendants:
+        if is_geom(ch):
+            out.add(ch)
     return list(out)
 
 def get_all_renderable_shapes_in_scene():
-    """シーン内のレンダリング対象 shape（camera/light を除外）"""
-    out = []
+    """シーン内のレンダリング対象シェイプ（カメラ/ライト除外）を返す。"""
+    all_shapes = cmds.ls(type="shape", long=True, noIntermediate=True) or []
+    renderable = []
     cache = {}
-    for shp in cmds.ls(type="shape", long=True, noIntermediate=True) or []:
+    for shp in all_shapes:
         try:
             nt = cmds.nodeType(shp)
             if nt not in cache:
                 try: cache[nt] = cmds.nodeType(nt, inherited=True) or []
-                except Exception: cache[nt] = []
+                except: cache[nt] = []
+            
             inh = cache[nt]
             if "camera" in inh or "light" in inh or "aiLight" in inh:
                 continue
-            out.append(shp)
-        except Exception: pass
-    return out
+            renderable.append(shp)
+        except Exception:
+            pass
+    return renderable
+
+def get_shapes_from_transforms(transform_nodes: list[str]) -> list[str]:
+    """トランスフォームノードリストから関連するシェイプを返す。"""
+    if not transform_nodes: return []
+    shapes = cmds.listRelatives(transform_nodes, shapes=True, noIntermediate=True, fullPath=True, allDescendents=True) or []
+    return sorted(list(set(shapes)))
 

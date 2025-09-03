@@ -5,26 +5,23 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 class RenderLayerToolView(QtWidgets.QWidget):
     """
-    UIを構築し、ウィジェット群を公開するView。階層表示・複数リスト対応版。
+    UIを構築し、ウィジェット群を公開するView。
     """
-    # シグナル定義
+    # ... (シグナル定義は変更なし) ...
     request_populate_tree = QtCore.Signal()
-    request_add_to_target = QtCore.Signal(str) # 'target' or 'pvoff'
-    request_remove_from_target = QtCore.Signal(str) # 'target' or 'pvoff'
-    
+    request_add_to_target = QtCore.Signal(str) 
+    request_remove_from_target = QtCore.Signal(str)
     request_create_layer = QtCore.Signal()
     request_layer_list_refresh = QtCore.Signal()
     request_delete_selected_layers = QtCore.Signal()
     request_delete_all_layers = QtCore.Signal()
-
-    # 新しいシグナル
-    widget_closed = QtCore.Signal() # クリーンアップ用
-    search_text_changed = QtCore.Signal(str) # 検索用
-    request_apply_aov_preset = QtCore.Signal(str) # AOVプリセット用
+    widget_closed = QtCore.Signal()
+    search_text_changed = QtCore.Signal(str)
+    request_apply_aov_preset = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super(RenderLayerToolView, self).__init__(parent)
-        self.setWindowTitle("Render Layer Tool (v6.1 - Visibility Fix)")
+        self.setWindowTitle("Render Layer Tool")
         self.setWindowFlags(QtCore.Qt.Window)
         self.resize(1150, 850)
         
@@ -32,7 +29,7 @@ class RenderLayerToolView(QtWidgets.QWidget):
         self._build_ui()
 
     def _load_icons(self):
-        """ノードタイプごとのアイコンをロードする。Maya標準アイコンを使用。"""
+        """ノードタイプごとのアイコンをロードする。"""
         self.icons = {
             'camera': QtGui.QIcon(":/camera.svg"),
             'light': QtGui.QIcon(":/light.svg"),
@@ -42,6 +39,7 @@ class RenderLayerToolView(QtWidgets.QWidget):
             'default': QtGui.QIcon(":/transform.svg")
         }
 
+    # ... (closeEvent, _build_ui, _create_lists_panelなどは変更なし) ...
     def closeEvent(self, event):
         self.widget_closed.emit()
         super(RenderLayerToolView, self).closeEvent(event)
@@ -94,12 +92,9 @@ class RenderLayerToolView(QtWidgets.QWidget):
         left_box_layout.addLayout(search_layout)
 
         self.scene_objects_tree = QtWidgets.QTreeWidget()
-        # NEW: ヘッダーを2列に変更
-        self.scene_objects_tree.setHeaderLabels(["Name", "Primary Visibility"])
+        self.scene_objects_tree.setHeaderLabels(["Name"])
         self.scene_objects_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.scene_objects_tree.setAlternatingRowColors(True)
-        # NEW: 列の幅を調整
-        self.scene_objects_tree.header().resizeSection(0, 280)
 
         selection_mode_box = QtWidgets.QGroupBox("リスト追加時の階層展開")
         selection_mode_layout = QtWidgets.QHBoxLayout(selection_mode_box)
@@ -189,16 +184,38 @@ class RenderLayerToolView(QtWidgets.QWidget):
         self.clear_pvoff_btn.clicked.connect(self.pvoff_list_widget.clear)
 
     def _on_tree_double_clicked(self, item, target_list_name):
+        # カテゴリヘッダーは無視
         if item.data(0, QtCore.Qt.UserRole):
             self.scene_objects_tree.clearSelection()
             item.setSelected(True)
             self.request_add_to_target.emit(target_list_name)
 
-    def populate_scene_tree_hierarchy(self, hierarchy_data):
+    def populate_scene_tree_hierarchy(self, categorized_data):
         self.scene_objects_tree.blockSignals(True)
         self.scene_objects_tree.clear()
 
-        def create_item(parent_widget, node_path, node_data):
+        # カテゴリの表示名と順番を定義
+        category_map = {
+            "geometry": "オブジェクト",
+            "lights": "ライト",
+            "cameras": "カメラ",
+            "groups": "グループ",
+            "other": "その他"
+        }
+
+        # カテゴリヘッダーを作成
+        category_items = {}
+        for key, display_name in category_map.items():
+            if categorized_data.get(key): # データがあるカテゴリのみ表示
+                header = QtWidgets.QTreeWidgetItem(self.scene_objects_tree)
+                header.setText(0, display_name)
+                font = header.font(0)
+                font.setBold(True)
+                header.setFont(0, font)
+                header.setFlags(header.flags() & ~QtCore.Qt.ItemIsSelectable) # 選択不可にする
+                category_items[key] = header
+
+        def create_item_recursive(parent_widget, node_path, node_data):
             short_name = node_path.split('|')[-1]
             item = QtWidgets.QTreeWidgetItem(parent_widget)
             item.setText(0, short_name)
@@ -209,78 +226,61 @@ class RenderLayerToolView(QtWidgets.QWidget):
             if icon and not icon.isNull():
                 item.setIcon(0, icon)
 
-            # NEW: Visibility情報の表示
-            vis_status = node_data.get('primaryVisibility')
-            if vis_status is not None:
-                if vis_status:
-                    item.setText(1, "ON")
-                    item.setForeground(1, QtGui.QColor("#4CAF50")) # Green
-                else:
-                    item.setText(1, "OFF")
-                    item.setForeground(1, QtGui.QColor("#F44336")) # Red
-            else:
-                 item.setText(1, "N/A") # グループなど
-                 item.setForeground(1, QtGui.QColor("#888888"))
-
             children_data = node_data.get('children', {})
             sorted_children = sorted(children_data.items(), key=lambda x: x[0].split('|')[-1].lower())
             
             for child_path, child_data in sorted_children:
-                create_item(item, child_path, child_data)
+                create_item_recursive(item, child_path, child_data)
 
-        sorted_hierarchy = sorted(hierarchy_data.items(), key=lambda x: x[0].split('|')[-1].lower())
-        for node_path, node_data in sorted_hierarchy:
-            create_item(self.scene_objects_tree, node_path, node_data)
+        # 各カテゴリにノードを追加
+        for category_key, root_nodes in categorized_data.items():
+            parent_item = category_items.get(category_key)
+            if parent_item:
+                sorted_nodes = sorted(root_nodes.items(), key=lambda x: x[0].split('|')[-1].lower())
+                for node_path, node_data in sorted_nodes:
+                    create_item_recursive(parent_item, node_path, node_data)
 
-        self.scene_objects_tree.expandToDepth(0) 
+        # すべてのカテゴリヘッダーを展開
+        self.scene_objects_tree.expandAll()
         self.scene_objects_tree.blockSignals(False)
 
     def filter_scene_tree(self, text):
+        # ... (変更なし) ...
         text = text.strip().lower()
         iterator = QtWidgets.QTreeWidgetItemIterator(self.scene_objects_tree)
         
-        if text:
-            while iterator.value():
-                item = iterator.value()
-                item.setHidden(True)
-                item.setExpanded(False)
-                iterator += 1
-        else:
-            self.scene_objects_tree.collapseAll()
-            self.scene_objects_tree.expandToDepth(0)
-            while iterator.value():
-                item = iterator.value()
-                item.setHidden(False)
-                iterator += 1
-            return
-
-        matching_items = self.scene_objects_tree.findItems(text, QtCore.Qt.MatchContains | QtCore.Qt.MatchRecursive | QtCore.Qt.MatchCaseSensitive)
-
-        for item in matching_items:
-            item.setHidden(False)
-            parent = item.parent()
-            while parent:
-                if parent.isHidden():
-                    parent.setHidden(False)
-                parent.setExpanded(True)
-                parent = parent.parent()
+        # フィルタリングのロジックはカテゴリ表示でもほぼ同じ
+        root = self.scene_objects_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            category_item = root.child(i)
+            has_visible_child = False
+            for j in range(category_item.childCount()):
+                child_item = category_item.child(j)
+                is_match = text in child_item.text(0).lower()
+                child_item.setHidden(not is_match)
+                if is_match:
+                    has_visible_child = True
+            category_item.setHidden(not has_visible_child)
+            if has_visible_child:
+                category_item.setExpanded(True)
+            else:
+                category_item.setExpanded(False)
 
     def sync_tree_selection(self, paths_to_select):
+        # ... (変更なし) ...
         self.scene_objects_tree.clearSelection()
-        if not paths_to_select:
-            return
+        if not paths_to_select: return
 
         selection_set = set(paths_to_select)
         first_selected_item = None
 
-        iterator = QtWidgets.QTreeWidgetItemIterator(self.scene_objects_tree)
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.scene_objects_tree, QtWidgets.QTreeWidgetItemIterator.Selectable)
         while iterator.value():
             item = iterator.value()
             item_path = item.data(0, QtCore.Qt.UserRole)
             if item_path in selection_set:
                 item.setSelected(True)
-                if first_selected_item is None:
-                    first_selected_item = item
+                if not first_selected_item: first_selected_item = item
                 
                 parent = item.parent()
                 while parent:
@@ -386,3 +386,4 @@ class RenderLayerToolView(QtWidgets.QWidget):
     def populate_render_layer_list(self, layer_names):
         self.layer_list_widget.clear()
         self.layer_list_widget.addItems(layer_names)
+
