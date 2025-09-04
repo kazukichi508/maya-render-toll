@@ -2,24 +2,13 @@
 # render_layer_tool/aov.py
 from __future__ import annotations
 import maya.cmds as cmds
-# --- 修正: 相対インポートから直接インポートに変更 ---
-from rs_utils import logger, _ensure_mtoa_loaded
+from rs_utils import logger, _ensure_mtoa_loaded, safe_create_override
 
-# AOV UI名 → 内部名
 AOV_NAME_MAP = {
-    "diffuse": "diffuse",
-    "specular": "specular",
-    "coat": "coat",
-    "transmission": "transmission",
-    "sss": "sss",
-    "volume": "volume",
-    "emission": "emission",
-    "background": "background",
-    "id": "id",
-    "shadow_matte": "shadow_matte",
-    "N": "N",
-    "P": "P",
-    "AO": "ambient_occlusion",
+    "diffuse": "diffuse", "specular": "specular", "coat": "coat",
+    "transmission": "transmission", "sss": "sss", "volume": "volume",
+    "emission": "emission", "background": "background", "id": "id",
+    "shadow_matte": "shadow_matte", "N": "N", "P": "P", "AO": "ambient_occlusion",
 }
 
 def ensure_aovs_exist(aov_ui_names):
@@ -31,19 +20,11 @@ def ensure_aovs_exist(aov_ui_names):
     except Exception:
         logger.warning("Could not import mtoa.aovs. Skipping AOV setup.")
         return []
-
     nodes = []
     for ui in aov_ui_names or []:
         internal = AOV_NAME_MAP.get(ui)
-        if not internal:
-            continue
-
-        plug = None
-        try:
-            plug = aov_if.getAOVNode(internal)
-        except Exception:
-            plug = None
-
+        if not internal: continue
+        plug = aov_if.getAOVNode(internal)
         if not plug:
             try:
                 aov_if.addAOV(internal)
@@ -52,19 +33,30 @@ def ensure_aovs_exist(aov_ui_names):
             except Exception as e:
                 cmds.warning(f"[AOV] create failed: {internal} ({e})")
                 continue
-
         if plug:
             node = str(plug).split(".", 1)[0]
             if cmds.objExists(node):
                 nodes.append(node)
-
     return nodes
 
-def setup_aov_collections(layer, layer_name: str, aov_settings: dict | None):
+def setup_aov_overrides(layer, layer_name: str, aov_settings: dict | None):
     """AOV 有効/無効のレイヤーオーバーライドを構築"""
-    # この関数は現在、直接は呼び出されていないため、実装は省略されています。
-    # 必要に応じて visibility.py の safe_create_override をインポートして使用してください。
-    # from rs_utils import safe_create_override
-    logger.debug("setup_aov_collections is not fully implemented.")
-    pass
+    if not aov_settings: return
 
+    aovs_to_enable_ui = [name for name, enabled in aov_settings.items() if enabled]
+    if not aovs_to_enable_ui:
+        logger.debug("No AOVs selected to enable.")
+        return
+        
+    aov_nodes = ensure_aovs_exist(aovs_to_enable_ui)
+    if not aov_nodes:
+        logger.warning("No valid AOV nodes found to create overrides for.")
+        return
+        
+    aov_col = layer.createCollection(f"{layer_name}_AOV")
+    
+    for node in aov_nodes:
+        if cmds.attributeQuery("enabled", node=node, exists=True):
+            safe_create_override(aov_col, node, "enabled", True)
+        else:
+            logger.warning(f"Attribute 'enabled' not found on node {node}. Skipping override.")

@@ -234,28 +234,22 @@ class RenderLayerToolController:
         self.view.set_status(f"{count} 件のアイテムを追加/移動しました。", "#7EE081")
 
     def _on_remove_from_list(self, list_name):
-        """【修正】リストからアイテムを削除する、より堅牢なロジック。"""
         target_list, _ = self._get_list_widgets(list_name)
         if not target_list:
             logger.warning(f"Remove operation failed: Could not find list widget for '{list_name}'.")
             return
 
-        # 削除対象のアイテムを事前にリストとして取得する
         items_to_remove = target_list.selectedItems()
-
         if not items_to_remove:
             self.view.set_status("リストから削除するアイテムを選択してください。", "#C8C000")
             return
         
-        # アイテムをループして削除する
         for item in items_to_remove:
-            # takeItemは行番号を必要とする
             row = target_list.row(item)
             if row != -1:
                 target_list.takeItem(row)
         
         self.view.set_status(f"{len(items_to_remove)} 件のアイテムをリストから戻しました。")
-
 
     def _suggest_layer_name(self):
         target_items = self._get_all_items(self.view.target_list_widget)
@@ -266,47 +260,35 @@ class RenderLayerToolController:
 
         base_name = target_items[0].split('|')[-1]
         cleaned_name = re.sub(r'[^a-zA-Z0-9_]', '_', base_name)
-
-        suggested = f"RL_{cleaned_name}_Solo" if len(target_items) == 1 else f"RL_{cleaned_name}_Group"
+        suggested = f"RL_{cleaned_name}"
+        if len(target_items) > 1:
+            suggested += "_Group"
         
         if self.view.layer_name_le.text().startswith("RL_") or not self.view.layer_name_le.text():
             self.view.layer_name_le.setText(suggested)
 
     def _on_create_layer(self):
+        """「レンダーレイヤー作成」ボタンが押されたときの処理。"""
         layer_name = self.view.layer_name_le.text().strip()
-        create_each = self.view.create_each_checkbox.isChecked()
-        auto_matte = self.view.auto_matte_checkbox.isChecked()
         target_items = self._get_all_items(self.view.target_list_widget)
-        pv_off_items = self._get_all_items(self.view.pvoff_list_widget)
-        aov_settings = self.view.get_aov_settings()
 
-        if not target_items and not pv_off_items and auto_matte:
-            self.view.set_status("リストが空で自動マットONの場合、何も映らないため作成を中断しました。", "orange")
+        if not target_items:
+            self.view.set_status("「レンダリング対象」リストにオブジェクトを追加してください。", "orange")
             return
-        if not create_each and not layer_name:
+        if not layer_name:
             self.view.set_status("レイヤー名を入力してください。", "orange")
             return
 
-        if create_each:
-            if not target_items:
-                self.view.set_status("個別作成モードでは、対象リストにアイテムが必要です。", "orange")
-                return
-            success, total = model.create_layers_for_each_solo_object(
-                target_items, pv_off_items, aov_settings, auto_matte
-            )
-            self.view.set_status(f"{success}/{total} 件の個別レイヤーを作成しました。", "#7EE081")
+        # レイヤー作成をモデルに依頼
+        success = model.create_render_layer(
+            layer_name=layer_name,
+            target_objects=target_items
+        )
+
+        if success:
+            self.view.set_status(f"レイヤー '{layer_name}' を作成/更新しました。", "lightgreen")
         else:
-            success = model.create_render_layer(
-                layer_name=layer_name,
-                target_objects=target_items,
-                pv_off_objects=pv_off_items,
-                auto_matte=auto_matte,
-                aov_settings=aov_settings
-            )
-            if success:
-                self.view.set_status(f"レイヤー '{layer_name}' を作成/更新しました。", "lightgreen")
-            else:
-                self.view.set_status(f"レイヤー '{layer_name}' の作成に失敗しました。", "red")
+            self.view.set_status(f"レイヤー '{layer_name}' の作成に失敗しました。", "red")
         
         self.refresh_layer_management_list()
 
@@ -329,7 +311,8 @@ class RenderLayerToolController:
             self.view.populate_render_layer_list(layers)
             for i in range(self.view.layer_list_widget.count()):
                 item = self.view.layer_list_widget.item(i)
-                if item.text() in selected_layers: item.setSelected(True)
+                if item.text() in selected_layers:
+                    item.setSelected(True)
         except AttributeError:
             logger.warning("View methods for layer management missing.")
 
@@ -339,16 +322,28 @@ class RenderLayerToolController:
         except AttributeError:
              logger.error("Cannot access layer_list_widget in View.")
              return
-        if not layer_names: return
+        if not layer_names:
+            self.view.set_status("削除するレイヤーをリストから選択してください。", "#C8C000")
+            return
         
-        reply = QtWidgets.QMessageBox.question(self.view, '削除の確認', f"{len(layer_names)} 件のレイヤーを削除しますか？\n\n- " + "\n- ".join(layer_names), QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        reply = QtWidgets.QMessageBox.question(self.view, '削除の確認', f"{len(layer_names)} 件のレイヤーを削除しますか？", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
         if reply == QtWidgets.QMessageBox.Yes:
-            model.delete_render_layers(layer_names)
+            if model.delete_render_layers(layer_names):
+                self.view.set_status(f"{len(layer_names)} 件のレイヤーを削除しました。", "#7EE081")
+            else:
+                self.view.set_status("レイヤーの削除に失敗しました。", "red")
             self.refresh_layer_management_list()
 
     def _on_delete_all_layers(self):
+        all_layers = model.get_all_render_layers()
+        if not all_layers:
+            self.view.set_status("削除するレンダーレイヤーがありません。", "#C8C000")
+            return
+
         reply = QtWidgets.QMessageBox.warning(self.view, '最終確認', "全てのレンダーレイヤーを削除します。\nこの操作は元に戻せません。よろしいですか？", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
         if reply == QtWidgets.QMessageBox.Yes:
-            model.delete_all_render_layers()
+            if model.delete_all_render_layers():
+                self.view.set_status("全てのレンダーレイヤーを削除しました。", "#7EE081")
+            else:
+                self.view.set_status("全レイヤーの削除に失敗しました。", "red")
             self.refresh_layer_management_list()
-
