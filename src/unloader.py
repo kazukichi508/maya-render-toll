@@ -5,15 +5,15 @@
 # Mayaのセッションから 'render_layer_tool' パッケージに関連する
 # 全てのモジュールをアンロード（削除）するためのスクリプトです。
 #
-# これにより、Mayaを再起動することなく、ツールのコード変更を
-# 完全に反映させることができます。
+# このスクリプトを実行することで、Mayaを再起動することなく、
+# ツールのコード変更を完全に反映させることができます。
 #
 # 使い方:
-# 1. 'model.py', 'view.py', 'controller.py', 'run.py' などのファイルを
+# 1. 'run.py', 'model.py', 'controller.py', 'view.py' などのファイルを
 #    編集して保存します。
 # 2. Mayaのスクリプトエディタで、まずこの 'unloader.py' を実行します。
-#    "Successfully unloaded render_layer_tool modules." と表示されれば成功です。
-# 3. 次に、'render_layer_tool.run.run()' を実行してツールを再起動します。
+#    "Successfully unloaded..." と表示されれば成功です。
+# 3. 次に、'run.py' を実行してツールを再起動します。
 #
 # ==============================================================================
 
@@ -28,12 +28,13 @@ def unload_tool_modules():
     modules_to_unload = [
         'render_layer_tool.run',
         'render_layer_tool.controller',
-        'render_layer_tool.view',
         'render_layer_tool.model',
+        'render_layer_tool.view',
         'render_layer_tool' # パッケージ本体
     ]
 
     unloaded_count = 0
+    print("--- Attempting to unload render_layer_tool modules ---")
     for module_name in modules_to_unload:
         if module_name in sys.modules:
             try:
@@ -44,13 +45,11 @@ def unload_tool_modules():
                 print(f"Could not unload {module_name}: {e}")
     
     if unloaded_count > 0:
-        print("\nSuccessfully unloaded render_layer_tool modules.")
+        print(f"\nSuccessfully unloaded {unloaded_count} render_layer_tool module(s).")
         print("You can now re-run the tool to see your changes.")
     else:
-        print("\nRender_layer_tool modules were not loaded in the first place.")
-
+        print("\nRender_layer_tool modules were not found in the current session.")
 
 # --- スクリプトの実行 ---
 if __name__ == "__main__":
     unload_tool_modules()
-
