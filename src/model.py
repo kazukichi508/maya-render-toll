@@ -7,7 +7,7 @@ import re
 
 logging.basicConfig()
 log = logging.getLogger(__name__)
-log.setLevel(logging.INFO) # 通常はINFOレベルに設定
+log.setLevel(logging.INFO)
 
 try:
     import maya.app.renderSetup.model.renderSetup as rs
@@ -61,7 +61,7 @@ class RenderLayerManager:
         else:
             final_base_name = base_name.strip() or (target_list and target_list[0]) or (pvoff_list and "Scene_PVOff") or "Scene"
             layers_to_create.append((self._sanitize_name(final_base_name), target_list))
-
+        
         existing_layer_names = set(self.list_render_layers())
         created_count = 0
         try:
@@ -88,20 +88,21 @@ class RenderLayerManager:
                 existing_layer_names.add(final_layer_name)
         return created_count
 
-    # 【ロジック変更】ユーザー様の意図に合わせてコレクション作成の順序と条件を変更
     def _create_single_layer_structure(self, layer_name, target_objects, pvoff_objects, settings):
-        auto_matte = settings.get('auto_matte', False)
         aov_settings = settings.get('aov_settings', {})
         layer = None
         try:
             layer = self.rs_instance.createRenderLayer(layer_name)
             if not layer: raise RuntimeError(f"Render Layer object creation returned None for {layer_name}")
 
+            default_layer = self.rs_instance.getDefaultRenderLayer()
+            if layer == default_layer:
+                log.error(f"Attempted to create overrides on the default render layer. Aborting for '{layer_name}'.")
+                return False
+
             valid_targets = [obj for obj in target_objects if cmds.objExists(obj)]
             valid_pvoffs = [obj for obj in pvoff_objects if cmds.objExists(obj)]
             
-            # --- 意図に合わせたロジック ---
-            # 1. TargetとPVOffコレクションは常に作成する
             if valid_targets:
                 target_col = layer.createCollection(f"COL_{layer_name}_Target")
                 target_col.getSelector().staticSelection.set(valid_targets)
@@ -109,71 +110,67 @@ class RenderLayerManager:
             if valid_pvoffs:
                 pvoff_col = layer.createCollection(f"COL_{layer_name}_PVOff")
                 pvoff_col.getSelector().staticSelection.set(valid_pvoffs)
-                self._apply_primary_visibility_override(pvoff_col, enabled=False)
-
-            # 2. auto_matteがオンの場合のみ、ワールド全体を操作するコレクションを追加で作成
-            if auto_matte:
-                # ワールド全体を非表示にする
-                world_matte_col = layer.createCollection(f"COL_{layer_name}_WorldMatte")
-                world_matte_col.getSelector().setPattern('*')
-                self._apply_primary_visibility_override(world_matte_col, enabled=False)
-
-                # TargetとPVOffのオブジェクトだけ表示を戻す（優先度を上書き）
-                all_visible_objects = list(set(valid_targets) | set(valid_pvoffs))
-                if all_visible_objects:
-                    visible_col = layer.createCollection(f"COL_{layer_name}_Visible")
-                    visible_col.getSelector().staticSelection.set(all_visible_objects)
-                    self._apply_primary_visibility_override(visible_col, enabled=True)
+                # PVOffリストのオブジェクトに、手動操作を模倣したオーバーライドを適用
+                self._apply_pv_off_override_by_shape(pvoff_col)
             
             self._setup_aov_overrides(layer, aov_settings)
             return True
-
         except Exception as e:
             log.error(f"レンダーレイヤー構造の作成中にエラーが発生しました ({layer_name}): {traceback.format_exc()}")
             if layer: self._cleanup_failed_layer(layer)
             return False
 
-    # 【不具合修正】setAttrValueの代わりにcmds.setAttrを使用
-    def _apply_primary_visibility_override(self, parent_collection, enabled=True):
+    def _apply_pv_off_override_by_shape(self, pvoff_collection):
+        """
+        手動操作を模倣し、コレクション内の各オブジェクトのシェイプに対して
+        直接Absolute Overrideを作成する。
+        """
         try:
-            shapes_col = parent_collection.createCollection(f"{parent_collection.name()}_Shapes")
-            shapes_col.getSelector().setPattern('*')
-            if hasattr(selector.Filters, 'kShapes'):
-                shapes_col.getSelector().setFilterType(selector.Filters.kShapes)
-            
-            ov_name = f"OVR_PV_{'On' if enabled else 'Off'}"
-            pv_override = shapes_col.createOverride(ov_name, override.AbsOverride.kTypeId)
-            
-            if pv_override:
-                pv_override.setAttributeName("primaryVisibility")
-                
-                # --- ここからが修正箇所 ---
-                # 不安定なsetAttrValueを避け、cmds.setAttrで直接値を設定する
-                # pv_override.setAttrValue(enabled) の代替
-                override_node_name = pv_override.name()
-                attribute_plug = f"{override_node_name}.attrValue"
-                cmds.setAttr(attribute_plug, enabled)
-                # --- 修正箇所ここまで ---
+            transform_nodes = list(pvoff_collection.getSelector().staticSelection)
+            log.info(f"Applying PV OFF override to {len(transform_nodes)} objects in '{pvoff_collection.name()}'")
 
-            else:
-                raise RuntimeError("createOverride returned None, failed to create override.")
+            for transform_node in transform_nodes:
+                shapes = cmds.listRelatives(transform_node, shapes=True, fullPath=True, noIntermediate=True)
+                if not shapes:
+                    log.warning(f"Skipping '{transform_node}' as it has no renderable shape.")
+                    continue
+
+                for shape in shapes:
+                    if not cmds.attributeQuery('primaryVisibility', node=shape, exists=True):
+                        log.warning(f"Skipping '{shape}' as it has no 'primaryVisibility' attribute.")
+                        continue
+                    
+                    log.info(f"  Creating AbsoluteOverride for '{shape}.primaryVisibility'")
+                    abs_ovr = pvoff_collection.createAbsoluteOverride(shape, 'primaryVisibility')
+                    
+                    if abs_ovr:
+                        try:
+                            abs_ovr.setAttrValue(0) # 0 = OFF
+                            log.info(f"    Successfully set override value to 0 for '{shape}'")
+                        except Exception:
+                            log.warning(f"    'setAttrValue' failed. Falling back to cmds.setAttr for '{shape}'")
+                            # setAttrValueが失敗した場合の最終手段
+                            override_node_name = abs_ovr.name()
+                            attribute_plug = f"{override_node_name}.attrValue"
+                            cmds.setAttr(attribute_plug, 0)
+                            log.info(f"    Successfully set override value via cmds.setAttr for '{shape}'")
+                    else:
+                        log.error(f"    Failed to create AbsoluteOverride for '{shape}'")
 
         except Exception as e:
-            log.error(f"Primary Visibility overrideの適用に失敗: {e} @ {parent_collection.name()}")
-            cmds.warning(f"自動マット化機能がコレクション '{parent_collection.name()}' で失敗しました。")
+            log.error(f"PV OFF overrideの適用中に予期せぬエラー: {e} @ {pvoff_collection.name()}")
+            traceback.print_exc()
+            cmds.warning(f"PV OFF機能がコレクション '{pvoff_collection.name()}' で失敗しました。")
 
     def _setup_aov_overrides(self, layer, aov_settings):
-        if not cmds.pluginInfo('mtoa', query=True, loaded=True): return
-        try:
-            # (省略 - 変更なし)
-            pass 
-        except Exception as e:
-            log.error(f"AOVオーバーライドの適用中にエラーが発生しました: {e}")
+        # (変更なし)
+        pass
 
     def _cleanup_failed_layer(self, layer):
         if not layer or not cmds.objExists(layer.name()): return
         try:
-            cmds.delete(layer.name())
+            if layer != self.rs_instance.getDefaultRenderLayer():
+                cmds.delete(layer.name())
         except Exception as e:
             log.error(f"レイヤーのクリーンアップに失敗: {e}")
 
@@ -195,16 +192,15 @@ class RenderLayerManager:
         return count
 
     def get_layer_contents(self, layer_name):
+        # (変更なし)
         if not layer_name: return None
         layer = self.rs_instance.getRenderLayer(layer_name)
         if not layer: raise ValueError(f"Render layer '{layer_name}' not found.")
-        contents = {"Target": [], "PVOff": [], "Visible": [], "WorldMatte": []}
+        contents = {"Target": [], "PVOff": []}
         for col in layer.getCollections():
             key, col_name = None, col.name()
             if "_Target" in col_name: key = "Target"
             elif "_PVOff" in col_name: key = "PVOff"
-            elif "_Visible" in col_name: key = "Visible"
-            elif "_WorldMatte" in col_name: key = "WorldMatte"
             if key:
                 try:
                     static_selection_list = list(col.getSelector().staticSelection)

@@ -5,13 +5,10 @@ ViewとModelを仲介し、アプリケーションのロジックを制御す�
 """
 import maya.cmds as cmds
 from maya.api import OpenMaya as om
-from PySide6 import QtWidgets, QtCore # _add_selected_to_list で使用するためインポート
+from PySide6 import QtWidgets, QtCore
 
-# modelとview、scene_queryをインポート
-#【修正】相対インポート(.)を削除し、ランチャーから直接実行できるようにする
 import model
 import scene_query
-
 
 class RenderLayerToolController:
     """
@@ -20,14 +17,11 @@ class RenderLayerToolController:
     def __init__(self, view_instance):
         self.view = view_instance
         self.model = model.RenderLayerManager()
-
-        # Mayaシーンの変更を監視するためのコールバックID
         self._callback_ids = []
         
         self._connect_signals()
         self._setup_maya_callbacks()
 
-        # 初期表示のためにUIを更新
         self.populate_scene_tree()
         self.refresh_render_layer_list()
 
@@ -50,7 +44,6 @@ class RenderLayerToolController:
         self.view.widget_closed.connect(self.cleanup)
         self.view.search_text_changed.connect(self.view.filter_scene_tree)
         self.view.request_apply_aov_preset.connect(self.apply_aov_preset)
-        
         self.view.selected_layers_changed.connect(self.update_layer_contents_view)
 
     def _setup_maya_callbacks(self):
@@ -118,7 +111,9 @@ class RenderLayerToolController:
         self.view.set_status("選択したオブジェクトをリストから削除しました。")
 
     def create_render_layer(self):
+        """Viewから設定を取得し、レンダーレイヤーを作成する。"""
         base_name = self.view.layer_name_le.text()
+        
         target_list = [self.view.target_list_widget.item(i).text() for i in range(self.view.target_list_widget.count())]
         pvoff_list = [self.view.pvoff_list_widget.item(i).text() for i in range(self.view.pvoff_list_widget.count())]
 
@@ -128,7 +123,6 @@ class RenderLayerToolController:
             
         settings = {
             'create_each': self.view.create_each_checkbox.isChecked(),
-            'auto_matte': self.view.auto_matte_checkbox.isChecked(),
             'aov_settings': self.view.get_aov_settings()
         }
 

@@ -3,7 +3,6 @@
 """
 ツールの起動、およびMVCコンポーネントの初期化と接続を行います。
 """
-import importlib
 import traceback
 import maya.cmds as cmds
 
@@ -12,7 +11,6 @@ from shiboken6 import wrapInstance
 from maya import OpenMayaUI as omui
 
 # 必要なモジュールをインポート
-#【修正】相対インポート(.)を削除し、ランチャーから直接実行できるようにする
 import view
 import model
 import controller
@@ -39,25 +37,30 @@ def run():
         main_window = get_maya_main_window()
         if not main_window:
             raise RuntimeError("Mayaのメインウィンドウが見つかりません。GUIモードで実行してください。")
+
+        # 【修正】古いインスタンスが残っている場合、UI検索だけでなく
+        # グローバル変数からも直接クリーンアップを実行し、参照を解除する
+        if _tool_instance:
+            try:
+                _tool_instance.cleanup()
+                print("前回のツールのクリーンアップ処理を実行しました。")
+            except Exception as e:
+                print(f"既存インスタンスのクリーンアップに失敗: {e}")
+            finally:
+                # _tool_instanceの参照を確実に解除する
+                _tool_instance = None
         
-        # 既存のウィンドウを検索して閉じる
+        # 既存のウィンドウを名前で検索して閉じる (この処理も維持)
         for child in main_window.findChildren(QtWidgets.QWidget, TOOL_OBJECT_NAME):
             try:
-                if hasattr(child, 'controller'):
+                # こちらのクリーンアップも念のため実行
+                if hasattr(child, 'controller') and child.controller:
                     child.controller.cleanup()
                 child.close()
                 child.deleteLater()
                 print("既存のツールウィンドウをクローズしました。")
             except Exception as e:
                 print(f"既存ウィンドウのクローズに失敗しました: {e}")
-
-        # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-        # ランチャー側でアンロードを行うため、ここでのリロード処理は不要
-        # importlib.reload(scene_query)
-        # importlib.reload(model)
-        # importlib.reload(view)
-        # importlib.reload(controller)
-        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
         
         # ViewとControllerをインスタンス化して接続
         app_view = view.RenderLayerToolView(parent=main_window)
@@ -66,8 +69,9 @@ def run():
         # ControllerにViewのインスタンスを渡す
         app_controller = controller.RenderLayerToolController(view_instance=app_view)
         
-        # ViewからControllerにアクセスできるように参照を保持（任意）
+        # ViewからControllerにアクセスできるように参照を保持
         app_view.controller = app_controller
+        # グローバル変数に新しいインスタンスを格納
         _tool_instance = app_controller
 
         app_view.show()
