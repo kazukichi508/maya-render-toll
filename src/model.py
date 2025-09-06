@@ -1,106 +1,113 @@
-# render_layer_tool/model.py
 # -*- coding: utf-8 -*-
+# render_layer_tool/model.py
 """
-データ処理とMayaのシーン操作を担当するModel層。
+Model層のファサード（Facade）。
+各専門モジュール（scene_query, layersなど）の機能を仲介する。
 """
 import maya.cmds as cmds
-from maya.app.renderSetup.model import renderSetup, renderLayer, override, selector
 
-class RenderLayerModel:
+# --- ここから修正箇所 ---
+RENDER_SETUP_API_AVAILABLE = False
+renderSetup = None  # 変数を事前に定義
+try:
+    # このモジュールがインポートできればAPIは利用可能と判断
+    from maya.app.renderSetup.model import renderSetup
+    RENDER_SETUP_API_AVAILABLE = True
+except ImportError:
+    # インポートに失敗した場合、APIは利用不可
+    pass
+# --- 修正箇所ここまで ---
+
+
+# --- scene_query.py からの機能 ---
+import scene_query
+def get_raw_selection():
+    """scene_queryのget_raw_selectionを公開する。"""
+    return scene_query.get_raw_selection()
+
+def get_categorized_scene_hierarchy():
+    """scene_queryのget_categorized_scene_hierarchyを公開する。"""
+    return scene_query.get_categorized_scene_hierarchy()
+
+def get_renderable_descendants(root_node):
+    """scene_queryのget_renderable_descendantsを公開する。"""
+    return scene_query.get_renderable_descendants(root_node)
+
+
+# --- layers.py からの機能 (再実装) ---
+
+def create_render_layer(layer_name, target_objects):
     """
-    ツールのコアロジックを管理するクラス。
+    layers.pyの代替機能。
+    指定された名前でレンダーレイヤーを作成し、対象オブジェクトをコレクションに追加する。
     """
-    def __init__(self):
-        try:
-            self.rs = renderSetup.instance()
-        except Exception as e:
-            raise RuntimeError(f"Render Setupの初期化に失敗しました: {e}")
+    if not RENDER_SETUP_API_AVAILABLE:
+        cmds.warning("Render Setup is not available in this version of Maya.")
+        return False
 
-    # --- レイヤー操作 ---
-    
-    def get_all_layers(self) -> list[str]:
-        layers = self.rs.getRenderLayers()
-        return [lyr.name() for lyr in layers if lyr.name() not in ('masterLayer', 'defaultRenderLayer')]
-
-    def create_layer(self, layer_name: str, targets: list[str], pv_off: list[str]) -> bool:
-        if not layer_name:
-            cmds.warning("レイヤー名が指定されていません。")
-            return False
+    try:
+        rs = renderSetup.instance()
+        
+        layer = rs.getRenderLayer(layer_name)
+        if not layer:
+            layer = rs.createRenderLayer(layer_name)
+        
+        for collection in layer.getCollections():
+            cmds.delete(collection.name())
             
-        layer = self.rs.getRenderLayer(layer_name) or self.rs.createRenderLayer(layer_name)
+        if not target_objects:
+            return True
 
-        if targets:
-            target_col = layer.createCollection(f"{layer_name}_TARGETS")
-            target_col.getSelector().setStaticSelection(targets)
-            ov = target_col.createAbsoluteOverride(targets[0], 'primaryVisibility')
-            ov.setAttrValue(True)
-
-        if pv_off:
-            pv_off_col = layer.createCollection(f"{layer_name}_MATTES")
-            pv_off_col.getSelector().setStaticSelection(pv_off)
-            ov = pv_off_col.createAbsoluteOverride(pv_off[0], 'primaryVisibility')
-            ov.setAttrValue(False)
-            
+        collection = layer.createCollection("render_targets")
+        pattern = " ".join(target_objects)
+        collection.getSelector().setPattern(pattern)
+        
         return True
+    except Exception as e:
+        cmds.warning(f"Failed to create/update render layer '{layer_name}': {e}")
+        return False
 
-    def delete_layers(self, layer_names: list[str]) -> bool:
-        if not layer_names:
-            return False
-        self._safe_switch_to_master()
-        for name in layer_names:
-            layer_to_delete = self.rs.getRenderLayer(name)
-            if layer_to_delete:
-                renderLayer.delete(layer_to_delete)
+def get_all_render_layers():
+    """
+    layers.pyの代替機能。
+    シーン内の全てのレンダーレイヤー名（defaultRenderLayerを除く）を返す。
+    """
+    if not RENDER_SETUP_API_AVAILABLE:
+        return []
+    try:
+        rs = renderSetup.instance()
+        layers = rs.getRenderLayers()
+        return [layer.name() for layer in layers if layer.name() != "defaultRenderLayer"]
+    except Exception:
+        return []
+
+def delete_render_layers(layer_names_to_delete):
+    """
+    layers.pyの代替機能。
+    指定された名前のレンダーレイヤーを削除する。
+    """
+    if not RENDER_SETUP_API_AVAILABLE:
+        return False
+    try:
+        rs = renderSetup.instance()
+        for layer_name in layer_names_to_delete:
+            layer = rs.getRenderLayer(layer_name)
+            if layer:
+                rs.delete(layer)
         return True
+    except Exception as e:
+        cmds.warning(f"Failed to delete render layers: {e}")
+        return False
 
-    def delete_all_layers(self) -> bool:
-        all_layers = self.get_all_layers()
-        return self.delete_layers(all_layers)
-
-    def _safe_switch_to_master(self):
-        master_layer = self.rs.getRenderLayer('masterLayer')
-        if self.rs.getVisibleRenderLayer() != master_layer:
-            self.rs.switchToLayer(master_layer)
-
-    # --- シーン情報 ---
-
-    def get_selection(self) -> list[str]:
-        return cmds.ls(sl=True, long=True) or []
-
-    def get_scene_hierarchy(self) -> dict:
-        hierarchy = {}
-        for root in cmds.ls(assemblies=True, long=True):
-            # --- ★★ここを修正★★ ---
-            # カメラ以外のオブジェクトでエラーが出ないようにtry...exceptで囲む
-            try:
-                if cmds.camera(root, q=True, startupCamera=True):
-                    continue
-            except RuntimeError:
-                # オブジェクトがカメラでない場合にこのエラーが発生するが、
-                # 処理を続行して問題ないため、passで無視する
-                pass
-            # -------------------------
-            
-            hierarchy[root] = self._build_hierarchy_recursive(root)
-        return hierarchy
-
-    def _build_hierarchy_recursive(self, node: str) -> dict:
-        node_info = {'type': 'group', 'primaryVisibility': None, 'children': {}}
-        shapes = cmds.listRelatives(node, shapes=True, noIntermediate=True, fullPath=True)
-        if shapes:
-            shape = shapes[0]
-            node_type = cmds.nodeType(shape)
-            if 'mesh' in node_type:
-                node_info['type'] = 'geometry'
-                if cmds.attributeQuery('primaryVisibility', node=shape, exists=True):
-                    node_info['primaryVisibility'] = cmds.getAttr(f"{shape}.primaryVisibility")
-            elif 'camera' in cmds.nodeType(shape, inherited=True):
-                node_info['type'] = 'camera'
-            elif 'light' in cmds.nodeType(shape, inherited=True):
-                node_info['type'] = 'light'
-
-        children = cmds.listRelatives(node, children=True, type='transform', fullPath=True) or []
-        for child in children:
-            node_info['children'][child] = self._build_hierarchy_recursive(child)
-            
-        return node_info
+def delete_all_render_layers():
+    """
+    layers.pyの代替機能。
+    全てのレンダーレイヤー（defaultRenderLayerを除く）を削除する。
+    """
+    try:
+        all_layers = get_all_render_layers()
+        if all_layers:
+            return delete_render_layers(all_layers)
+        return True
+    except Exception:
+        return False
