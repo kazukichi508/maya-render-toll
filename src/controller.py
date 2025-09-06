@@ -128,7 +128,13 @@ class RenderLayerToolController:
 
         try:
             cmds.undoInfo(openChunk=True)
-            created_count = self.model.create_render_layers(base_name, target_list, pvoff_list, settings)
+            # 【ロジック変更】Modelに全ての情報を渡し、レイヤー作成を依頼する
+            created_count = self.model.create_layers_from_lists(
+                base_name=base_name,
+                target_list=target_list,
+                pvoff_list=pvoff_list,
+                settings=settings
+            )
             if created_count > 0:
                 self.view.set_status(f"{created_count}個のレンダーレイヤーを作成しました。", color="#7EE081")
                 self.refresh_render_layer_list()

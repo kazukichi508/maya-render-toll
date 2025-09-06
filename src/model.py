@@ -52,38 +52,57 @@ class RenderLayerManager:
         if not sanitized.startswith("RL_"): sanitized = "RL_" + sanitized
         return sanitized
 
-    def create_render_layers(self, base_name, target_list, pvoff_list, settings):
+    def create_layers_from_lists(self, base_name, target_list, pvoff_list, settings):
+        """
+        TargetリストとPVOffリストから、それぞれ独立したレンダーレイヤーを作成する。
+        """
         create_each = settings.get('create_each', False)
-        layers_to_create = []
-        if create_each:
-            if not target_list: raise ValueError("個別作成モードでは、対象リストに最低1つのオブジェクトが必要です。")
-            for obj in target_list: layers_to_create.append((self._sanitize_name(obj), [obj]))
-        else:
-            final_base_name = base_name.strip() or (target_list and target_list[0]) or (pvoff_list and "Scene_PVOff") or "Scene"
-            layers_to_create.append((self._sanitize_name(final_base_name), target_list))
         
+        layers_to_create_info = []
+
+        if target_list:
+            if create_each:
+                for obj in target_list:
+                    layer_name = self._sanitize_name(obj)
+                    layers_to_create_info.append({'name': layer_name, 'targets': [obj], 'pvoffs': []})
+            else:
+                layer_name = self._sanitize_name(base_name or target_list[0])
+                layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': []})
+
+        if pvoff_list:
+            layer_name = self._sanitize_name((base_name or "Scene") + "_PVOff")
+            layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': pvoff_list})
+
+        if not layers_to_create_info:
+            return 0
+
         existing_layer_names = set(self.list_render_layers())
         created_count = 0
         try:
             if rsInternal:
                 with rsInternal.deferredEvaluation(True):
-                    created_count = self._execute_layer_creation(layers_to_create, existing_layer_names, pvoff_list, settings)
+                    created_count = self._execute_layer_creation(layers_to_create_info, existing_layer_names, settings)
             else:
-                created_count = self._execute_layer_creation(layers_to_create, existing_layer_names, pvoff_list, settings)
+                created_count = self._execute_layer_creation(layers_to_create_info, existing_layer_names, settings)
         except Exception as e:
             log.error(f"レイヤー作成バッチ処理中にエラーが発生しました: {e}")
             raise
         return created_count
 
-    def _execute_layer_creation(self, layers_to_create, existing_layer_names, pvoff_list, settings):
+    def _execute_layer_creation(self, layers_to_create_info, existing_layer_names, settings):
         created_count = 0
-        for layer_name_base, targets in layers_to_create:
+        for layer_info in layers_to_create_info:
+            layer_name_base = layer_info['name']
+            targets = layer_info['targets']
+            pvoffs = layer_info['pvoffs']
+            
             final_layer_name = layer_name_base
             counter = 1
             while final_layer_name in existing_layer_names or cmds.objExists(final_layer_name):
                  final_layer_name = f"{layer_name_base}_{counter}"
                  counter += 1
-            if self._create_single_layer_structure(final_layer_name, targets, pvoff_list, settings):
+            
+            if self._create_single_layer_structure(final_layer_name, targets, pvoffs, settings):
                 created_count += 1
                 existing_layer_names.add(final_layer_name)
         return created_count
@@ -103,15 +122,22 @@ class RenderLayerManager:
             valid_targets = [obj for obj in target_objects if cmds.objExists(obj)]
             valid_pvoffs = [obj for obj in pvoff_objects if cmds.objExists(obj)]
             
+            # 【ロジック逆転】レイヤー名に「_PVOff」が含まれるかで挙動を切り替える
+            is_pvoff_layer = "_PVOff" in layer_name
+
             if valid_targets:
                 target_col = layer.createCollection(f"COL_{layer_name}_Target")
                 target_col.getSelector().staticSelection.set(valid_targets)
+                # PVOffレイヤーの場合、TargetのPVはOFFにする。それ以外はON。
+                target_enabled = False if is_pvoff_layer else True
+                self._apply_pv_override_by_shape(target_col, enabled=target_enabled)
 
             if valid_pvoffs:
                 pvoff_col = layer.createCollection(f"COL_{layer_name}_PVOff")
                 pvoff_col.getSelector().staticSelection.set(valid_pvoffs)
-                # PVOffリストのオブジェクトに、手動操作を模倣したオーバーライドを適用
-                self._apply_pv_off_override_by_shape(pvoff_col)
+                # PVOffレイヤーの場合、PVOffリストのPVはONにする。それ以外はOFF。
+                pvoff_enabled = True if is_pvoff_layer else False
+                self._apply_pv_override_by_shape(pvoff_col, enabled=pvoff_enabled)
             
             self._setup_aov_overrides(layer, aov_settings)
             return True
@@ -120,14 +146,15 @@ class RenderLayerManager:
             if layer: self._cleanup_failed_layer(layer)
             return False
 
-    def _apply_pv_off_override_by_shape(self, pvoff_collection):
+    def _apply_pv_override_by_shape(self, collection, enabled=True):
         """
         手動操作を模倣し、コレクション内の各オブジェクトのシェイプに対して
-        直接Absolute Overrideを作成する。
+        直接Absolute Overrideを作成し、Primary VisibilityをON/OFFする。
         """
         try:
-            transform_nodes = list(pvoff_collection.getSelector().staticSelection)
-            log.info(f"Applying PV OFF override to {len(transform_nodes)} objects in '{pvoff_collection.name()}'")
+            transform_nodes = list(collection.getSelector().staticSelection)
+            status = "ON" if enabled else "OFF"
+            log.info(f"Applying PV {status} override to {len(transform_nodes)} objects in '{collection.name()}'")
 
             for transform_node in transform_nodes:
                 shapes = cmds.listRelatives(transform_node, shapes=True, fullPath=True, noIntermediate=True)
@@ -141,26 +168,26 @@ class RenderLayerManager:
                         continue
                     
                     log.info(f"  Creating AbsoluteOverride for '{shape}.primaryVisibility'")
-                    abs_ovr = pvoff_collection.createAbsoluteOverride(shape, 'primaryVisibility')
+                    abs_ovr = collection.createAbsoluteOverride(shape, 'primaryVisibility')
                     
                     if abs_ovr:
                         try:
-                            abs_ovr.setAttrValue(0) # 0 = OFF
-                            log.info(f"    Successfully set override value to 0 for '{shape}'")
+                            value = 1 if enabled else 0
+                            abs_ovr.setAttrValue(value)
+                            log.info(f"    Successfully set override value to {value} for '{shape}'")
                         except Exception:
                             log.warning(f"    'setAttrValue' failed. Falling back to cmds.setAttr for '{shape}'")
-                            # setAttrValueが失敗した場合の最終手段
                             override_node_name = abs_ovr.name()
                             attribute_plug = f"{override_node_name}.attrValue"
-                            cmds.setAttr(attribute_plug, 0)
+                            cmds.setAttr(attribute_plug, value)
                             log.info(f"    Successfully set override value via cmds.setAttr for '{shape}'")
                     else:
                         log.error(f"    Failed to create AbsoluteOverride for '{shape}'")
 
         except Exception as e:
-            log.error(f"PV OFF overrideの適用中に予期せぬエラー: {e} @ {pvoff_collection.name()}")
+            log.error(f"PV overrideの適用中に予期せぬエラー: {e} @ {collection.name()}")
             traceback.print_exc()
-            cmds.warning(f"PV OFF機能がコレクション '{pvoff_collection.name()}' で失敗しました。")
+            cmds.warning(f"PV機能がコレクション '{collection.name()}' で失敗しました。")
 
     def _setup_aov_overrides(self, layer, aov_settings):
         # (変更なし)
