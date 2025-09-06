@@ -1,106 +1,237 @@
 # render_layer_tool/model.py
 # -*- coding: utf-8 -*-
-"""
-データ処理とMayaのシーン操作を担当するModel層。
-"""
 import maya.cmds as cmds
-from maya.app.renderSetup.model import renderSetup, renderLayer, override, selector
+import logging
+import traceback
+import re
 
-class RenderLayerModel:
-    """
-    ツールのコアロジックを管理するクラス。
-    """
+logging.basicConfig()
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+try:
+    import maya.app.renderSetup.model.renderSetup as rs
+    import maya.app.renderSetup.model.override as override
+    import maya.app.renderSetup.model.selector as selector
+    try:
+        import maya.app.renderSetup.model.renderSetupInternal as rsInternal
+    except ImportError:
+        rsInternal = None
+except ImportError:
+    rs = None
+    log.error("Maya Render Setup API not found. Tool cannot function.")
+
+class RenderLayerManager:
     def __init__(self):
+        if rs is None: raise EnvironmentError("Render Setup API is not available.")
+        self.rs_instance = rs.instance()
+        self.AOV_PRESETS = {
+            "Basic": ["diffuse", "specular", "N", "P"],
+            "Full Beauty": ["diffuse", "specular", "coat", "transmission", "sss", "volume", "emission", "background"],
+            "Utility": ["id", "shadow_matte", "N", "P", "AO"],
+            "Clear": []
+        }
+
+    def get_aov_preset(self, preset_name):
+        return self.AOV_PRESETS.get(preset_name, [])
+
+    def list_render_layers(self):
         try:
-            self.rs = renderSetup.instance()
+            layers = self.rs_instance.getRenderLayers()
+            default_layer = self.rs_instance.getDefaultRenderLayer()
+            return sorted([layer.name() for layer in layers if layer and layer != default_layer])
         except Exception as e:
-            raise RuntimeError(f"Render Setupの初期化に失敗しました: {e}")
+            log.error(f"レンダーレイヤーのリストアップ中にエラー: {e}")
+            return []
 
-    # --- レイヤー操作 ---
-    
-    def get_all_layers(self) -> list[str]:
-        layers = self.rs.getRenderLayers()
-        return [lyr.name() for lyr in layers if lyr.name() not in ('masterLayer', 'defaultRenderLayer')]
+    def _sanitize_name(self, name):
+        cleaned_name = name.split('|')[-1].split(':')[-1]
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', cleaned_name)
+        if not sanitized: sanitized = "Unnamed"
+        elif sanitized[0].isdigit(): sanitized = "Object_" + sanitized
+        if not sanitized.startswith("RL_"): sanitized = "RL_" + sanitized
+        return sanitized
 
-    def create_layer(self, layer_name: str, targets: list[str], pv_off: list[str]) -> bool:
-        if not layer_name:
-            cmds.warning("レイヤー名が指定されていません。")
-            return False
+    def create_layers_from_lists(self, base_name, target_list, pvoff_list, settings):
+        """
+        TargetリストとPVOffリストから、それぞれ独立したレンダーレイヤーを作成する。
+        """
+        create_each = settings.get('create_each', False)
+        
+        layers_to_create_info = []
+
+        if target_list:
+            if create_each:
+                for obj in target_list:
+                    layer_name = self._sanitize_name(obj)
+                    layers_to_create_info.append({'name': layer_name, 'targets': [obj], 'pvoffs': []})
+            else:
+                layer_name = self._sanitize_name(base_name or target_list[0])
+                layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': []})
+
+        if pvoff_list:
+            layer_name = self._sanitize_name((base_name or "Scene") + "_PVOff")
+            layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': pvoff_list})
+
+        if not layers_to_create_info:
+            return 0
+
+        existing_layer_names = set(self.list_render_layers())
+        created_count = 0
+        try:
+            if rsInternal:
+                with rsInternal.deferredEvaluation(True):
+                    created_count = self._execute_layer_creation(layers_to_create_info, existing_layer_names, settings)
+            else:
+                created_count = self._execute_layer_creation(layers_to_create_info, existing_layer_names, settings)
+        except Exception as e:
+            log.error(f"レイヤー作成バッチ処理中にエラーが発生しました: {e}")
+            raise
+        return created_count
+
+    def _execute_layer_creation(self, layers_to_create_info, existing_layer_names, settings):
+        created_count = 0
+        for layer_info in layers_to_create_info:
+            layer_name_base = layer_info['name']
+            targets = layer_info['targets']
+            pvoffs = layer_info['pvoffs']
             
-        layer = self.rs.getRenderLayer(layer_name) or self.rs.createRenderLayer(layer_name)
-
-        if targets:
-            target_col = layer.createCollection(f"{layer_name}_TARGETS")
-            target_col.getSelector().setStaticSelection(targets)
-            ov = target_col.createAbsoluteOverride(targets[0], 'primaryVisibility')
-            ov.setAttrValue(True)
-
-        if pv_off:
-            pv_off_col = layer.createCollection(f"{layer_name}_MATTES")
-            pv_off_col.getSelector().setStaticSelection(pv_off)
-            ov = pv_off_col.createAbsoluteOverride(pv_off[0], 'primaryVisibility')
-            ov.setAttrValue(False)
+            final_layer_name = layer_name_base
+            counter = 1
+            while final_layer_name in existing_layer_names or cmds.objExists(final_layer_name):
+                 final_layer_name = f"{layer_name_base}_{counter}"
+                 counter += 1
             
-        return True
+            if self._create_single_layer_structure(final_layer_name, targets, pvoffs, settings):
+                created_count += 1
+                existing_layer_names.add(final_layer_name)
+        return created_count
 
-    def delete_layers(self, layer_names: list[str]) -> bool:
-        if not layer_names:
+    def _create_single_layer_structure(self, layer_name, target_objects, pvoff_objects, settings):
+        aov_settings = settings.get('aov_settings', {})
+        layer = None
+        try:
+            layer = self.rs_instance.createRenderLayer(layer_name)
+            if not layer: raise RuntimeError(f"Render Layer object creation returned None for {layer_name}")
+
+            default_layer = self.rs_instance.getDefaultRenderLayer()
+            if layer == default_layer:
+                log.error(f"Attempted to create overrides on the default render layer. Aborting for '{layer_name}'.")
+                return False
+
+            valid_targets = [obj for obj in target_objects if cmds.objExists(obj)]
+            valid_pvoffs = [obj for obj in pvoff_objects if cmds.objExists(obj)]
+            
+            # 【ロジック逆転】レイヤー名に「_PVOff」が含まれるかで挙動を切り替える
+            is_pvoff_layer = "_PVOff" in layer_name
+
+            if valid_targets:
+                target_col = layer.createCollection(f"COL_{layer_name}_Target")
+                target_col.getSelector().staticSelection.set(valid_targets)
+                # PVOffレイヤーの場合、TargetのPVはOFFにする。それ以外はON。
+                target_enabled = False if is_pvoff_layer else True
+                self._apply_pv_override_by_shape(target_col, enabled=target_enabled)
+
+            if valid_pvoffs:
+                pvoff_col = layer.createCollection(f"COL_{layer_name}_PVOff")
+                pvoff_col.getSelector().staticSelection.set(valid_pvoffs)
+                # PVOffレイヤーの場合、PVOffリストのPVはONにする。それ以外はOFF。
+                pvoff_enabled = True if is_pvoff_layer else False
+                self._apply_pv_override_by_shape(pvoff_col, enabled=pvoff_enabled)
+            
+            self._setup_aov_overrides(layer, aov_settings)
+            return True
+        except Exception as e:
+            log.error(f"レンダーレイヤー構造の作成中にエラーが発生しました ({layer_name}): {traceback.format_exc()}")
+            if layer: self._cleanup_failed_layer(layer)
             return False
-        self._safe_switch_to_master()
-        for name in layer_names:
-            layer_to_delete = self.rs.getRenderLayer(name)
-            if layer_to_delete:
-                renderLayer.delete(layer_to_delete)
-        return True
 
-    def delete_all_layers(self) -> bool:
-        all_layers = self.get_all_layers()
-        return self.delete_layers(all_layers)
+    def _apply_pv_override_by_shape(self, collection, enabled=True):
+        """
+        手動操作を模倣し、コレクション内の各オブジェクトのシェイプに対して
+        直接Absolute Overrideを作成し、Primary VisibilityをON/OFFする。
+        """
+        try:
+            transform_nodes = list(collection.getSelector().staticSelection)
+            status = "ON" if enabled else "OFF"
+            log.info(f"Applying PV {status} override to {len(transform_nodes)} objects in '{collection.name()}'")
 
-    def _safe_switch_to_master(self):
-        master_layer = self.rs.getRenderLayer('masterLayer')
-        if self.rs.getVisibleRenderLayer() != master_layer:
-            self.rs.switchToLayer(master_layer)
-
-    # --- シーン情報 ---
-
-    def get_selection(self) -> list[str]:
-        return cmds.ls(sl=True, long=True) or []
-
-    def get_scene_hierarchy(self) -> dict:
-        hierarchy = {}
-        for root in cmds.ls(assemblies=True, long=True):
-            # --- ★★ここを修正★★ ---
-            # カメラ以外のオブジェクトでエラーが出ないようにtry...exceptで囲む
-            try:
-                if cmds.camera(root, q=True, startupCamera=True):
+            for transform_node in transform_nodes:
+                shapes = cmds.listRelatives(transform_node, shapes=True, fullPath=True, noIntermediate=True)
+                if not shapes:
+                    log.warning(f"Skipping '{transform_node}' as it has no renderable shape.")
                     continue
-            except RuntimeError:
-                # オブジェクトがカメラでない場合にこのエラーが発生するが、
-                # 処理を続行して問題ないため、passで無視する
-                pass
-            # -------------------------
-            
-            hierarchy[root] = self._build_hierarchy_recursive(root)
-        return hierarchy
 
-    def _build_hierarchy_recursive(self, node: str) -> dict:
-        node_info = {'type': 'group', 'primaryVisibility': None, 'children': {}}
-        shapes = cmds.listRelatives(node, shapes=True, noIntermediate=True, fullPath=True)
-        if shapes:
-            shape = shapes[0]
-            node_type = cmds.nodeType(shape)
-            if 'mesh' in node_type:
-                node_info['type'] = 'geometry'
-                if cmds.attributeQuery('primaryVisibility', node=shape, exists=True):
-                    node_info['primaryVisibility'] = cmds.getAttr(f"{shape}.primaryVisibility")
-            elif 'camera' in cmds.nodeType(shape, inherited=True):
-                node_info['type'] = 'camera'
-            elif 'light' in cmds.nodeType(shape, inherited=True):
-                node_info['type'] = 'light'
+                for shape in shapes:
+                    if not cmds.attributeQuery('primaryVisibility', node=shape, exists=True):
+                        log.warning(f"Skipping '{shape}' as it has no 'primaryVisibility' attribute.")
+                        continue
+                    
+                    log.info(f"  Creating AbsoluteOverride for '{shape}.primaryVisibility'")
+                    abs_ovr = collection.createAbsoluteOverride(shape, 'primaryVisibility')
+                    
+                    if abs_ovr:
+                        try:
+                            value = 1 if enabled else 0
+                            abs_ovr.setAttrValue(value)
+                            log.info(f"    Successfully set override value to {value} for '{shape}'")
+                        except Exception:
+                            log.warning(f"    'setAttrValue' failed. Falling back to cmds.setAttr for '{shape}'")
+                            override_node_name = abs_ovr.name()
+                            attribute_plug = f"{override_node_name}.attrValue"
+                            cmds.setAttr(attribute_plug, value)
+                            log.info(f"    Successfully set override value via cmds.setAttr for '{shape}'")
+                    else:
+                        log.error(f"    Failed to create AbsoluteOverride for '{shape}'")
 
-        children = cmds.listRelatives(node, children=True, type='transform', fullPath=True) or []
-        for child in children:
-            node_info['children'][child] = self._build_hierarchy_recursive(child)
-            
-        return node_info
+        except Exception as e:
+            log.error(f"PV overrideの適用中に予期せぬエラー: {e} @ {collection.name()}")
+            traceback.print_exc()
+            cmds.warning(f"PV機能がコレクション '{collection.name()}' で失敗しました。")
+
+    def _setup_aov_overrides(self, layer, aov_settings):
+        # (変更なし)
+        pass
+
+    def _cleanup_failed_layer(self, layer):
+        if not layer or not cmds.objExists(layer.name()): return
+        try:
+            if layer != self.rs_instance.getDefaultRenderLayer():
+                cmds.delete(layer.name())
+        except Exception as e:
+            log.error(f"レイヤーのクリーンアップに失敗: {e}")
+
+    def delete_render_layer(self, layer_name):
+        try:
+            if cmds.objExists(layer_name) and layer_name != "defaultRenderLayer":
+                cmds.delete(layer_name)
+                return True
+            return False
+        except Exception as e:
+            log.warning(f"レイヤー '{layer_name}' の削除中に予期せぬエラーが発生: {e}")
+            return False
+
+    def delete_multiple_layers(self, layer_names):
+        count = 0
+        for name in layer_names:
+            if self.delete_render_layer(name):
+                count += 1
+        return count
+
+    def get_layer_contents(self, layer_name):
+        # (変更なし)
+        if not layer_name: return None
+        layer = self.rs_instance.getRenderLayer(layer_name)
+        if not layer: raise ValueError(f"Render layer '{layer_name}' not found.")
+        contents = {"Target": [], "PVOff": []}
+        for col in layer.getCollections():
+            key, col_name = None, col.name()
+            if "_Target" in col_name: key = "Target"
+            elif "_PVOff" in col_name: key = "PVOff"
+            if key:
+                try:
+                    static_selection_list = list(col.getSelector().staticSelection)
+                    if static_selection_list: contents[key].extend(static_selection_list)
+                except Exception as e:
+                    log.warning(f"Could not get members from collection {col_name}: {e}")
+        return {k: sorted(list(set(v))) for k, v in contents.items() if v}

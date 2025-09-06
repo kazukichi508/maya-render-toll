@@ -7,7 +7,6 @@ class RenderLayerToolView(QtWidgets.QWidget):
     """
     UIを構築し、ウィジェット群を公開するView。
     """
-    # ... (シグナル定義は変更なし) ...
     request_populate_tree = QtCore.Signal()
     request_add_to_target = QtCore.Signal(str) 
     request_remove_from_target = QtCore.Signal(str)
@@ -18,6 +17,7 @@ class RenderLayerToolView(QtWidgets.QWidget):
     widget_closed = QtCore.Signal()
     search_text_changed = QtCore.Signal(str)
     request_apply_aov_preset = QtCore.Signal(str)
+    selected_layers_changed = QtCore.Signal(list)
 
     def __init__(self, parent=None):
         super(RenderLayerToolView, self).__init__(parent)
@@ -36,10 +36,10 @@ class RenderLayerToolView(QtWidgets.QWidget):
             'geometry': QtGui.QIcon(":/mesh.svg"),
             'group': QtGui.QIcon(":/transform.svg"),
             'other': QtGui.QIcon(":/locator.svg"),
-            'default': QtGui.QIcon(":/transform.svg")
+            'default': QtGui.QIcon(":/transform.svg"),
+            'collection': QtGui.QIcon(":/collection.svg"),
         }
 
-    # ... (closeEvent, _build_ui, _create_lists_panelなどは変更なし) ...
     def closeEvent(self, event):
         self.widget_closed.emit()
         super(RenderLayerToolView, self).closeEvent(event)
@@ -183,8 +183,14 @@ class RenderLayerToolView(QtWidgets.QWidget):
         self.clear_target_btn.clicked.connect(self.target_list_widget.clear)
         self.clear_pvoff_btn.clicked.connect(self.pvoff_list_widget.clear)
 
+        self.layer_list_widget.itemSelectionChanged.connect(self._on_layer_selection_changed)
+
+    def _on_layer_selection_changed(self):
+        selected_items = self.layer_list_widget.selectedItems()
+        layer_names = [item.text() for item in selected_items]
+        self.selected_layers_changed.emit(layer_names)
+
     def _on_tree_double_clicked(self, item, target_list_name):
-        # カテゴリヘッダーは無視
         if item.data(0, QtCore.Qt.UserRole):
             self.scene_objects_tree.clearSelection()
             item.setSelected(True)
@@ -194,25 +200,18 @@ class RenderLayerToolView(QtWidgets.QWidget):
         self.scene_objects_tree.blockSignals(True)
         self.scene_objects_tree.clear()
 
-        # カテゴリの表示名と順番を定義
-        category_map = {
-            "geometry": "オブジェクト",
-            "lights": "ライト",
-            "cameras": "カメラ",
-            "groups": "グループ",
-            "other": "その他"
-        }
+        category_map = {"groups": "グループ", "objects": "オブジェクト", "other": "その他"}
+        category_order = ["groups", "objects", "other"]
 
-        # カテゴリヘッダーを作成
         category_items = {}
-        for key, display_name in category_map.items():
-            if categorized_data.get(key): # データがあるカテゴリのみ表示
+        for key in category_order:
+            if categorized_data.get(key):
                 header = QtWidgets.QTreeWidgetItem(self.scene_objects_tree)
-                header.setText(0, display_name)
+                header.setText(0, category_map.get(key))
                 font = header.font(0)
                 font.setBold(True)
                 header.setFont(0, font)
-                header.setFlags(header.flags() & ~QtCore.Qt.ItemIsSelectable) # 選択不可にする
+                header.setFlags(header.flags() & ~QtCore.Qt.ItemIsSelectable)
                 category_items[key] = header
 
         def create_item_recursive(parent_widget, node_path, node_data):
@@ -220,7 +219,6 @@ class RenderLayerToolView(QtWidgets.QWidget):
             item = QtWidgets.QTreeWidgetItem(parent_widget)
             item.setText(0, short_name)
             item.setData(0, QtCore.Qt.UserRole, node_path)
-            
             node_type = node_data.get('type', 'default')
             icon = self.icons.get(node_type, self.icons['default'])
             if icon and not icon.isNull():
@@ -232,24 +230,19 @@ class RenderLayerToolView(QtWidgets.QWidget):
             for child_path, child_data in sorted_children:
                 create_item_recursive(item, child_path, child_data)
 
-        # 各カテゴリにノードを追加
-        for category_key, root_nodes in categorized_data.items():
+        for category_key in category_order:
             parent_item = category_items.get(category_key)
             if parent_item:
+                root_nodes = categorized_data.get(category_key, {})
                 sorted_nodes = sorted(root_nodes.items(), key=lambda x: x[0].split('|')[-1].lower())
                 for node_path, node_data in sorted_nodes:
                     create_item_recursive(parent_item, node_path, node_data)
 
-        # すべてのカテゴリヘッダーを展開
         self.scene_objects_tree.expandAll()
         self.scene_objects_tree.blockSignals(False)
 
     def filter_scene_tree(self, text):
-        # ... (変更なし) ...
         text = text.strip().lower()
-        iterator = QtWidgets.QTreeWidgetItemIterator(self.scene_objects_tree)
-        
-        # フィルタリングのロジックはカテゴリ表示でもほぼ同じ
         root = self.scene_objects_tree.invisibleRootItem()
         for i in range(root.childCount()):
             category_item = root.child(i)
@@ -267,7 +260,6 @@ class RenderLayerToolView(QtWidgets.QWidget):
                 category_item.setExpanded(False)
 
     def sync_tree_selection(self, paths_to_select):
-        # ... (変更なし) ...
         self.scene_objects_tree.clearSelection()
         if not paths_to_select: return
 
@@ -337,22 +329,15 @@ class RenderLayerToolView(QtWidgets.QWidget):
         create_box = QtWidgets.QGroupBox("3) レイヤー作成")
         main_layout = QtWidgets.QVBoxLayout(create_box)
         settings_l = QtWidgets.QHBoxLayout()
+        
         self.layer_name_le = QtWidgets.QLineEdit()
         self.layer_name_le.setPlaceholderText("例: RL_Character_Solo")
         
-        self.auto_matte_checkbox = QtWidgets.QCheckBox("自動マット化 (Soloモード)")
-        self.auto_matte_checkbox.setChecked(True)
-        self.auto_matte_checkbox.setToolTip(
-            "ON: 「対象リスト」と「PV OFFリスト」以外の全オブジェクトを自動的にマット化(PV Off)します。\n"
-            "OFF: リスト以外のオブジェクトはそのまま表示されます。"
-        )
-
         self.create_each_checkbox = QtWidgets.QCheckBox("個別作成")
         self.create_each_checkbox.setToolTip("「対象リスト」内の各オブジェクトに対して個別にレイヤーを作成します。（PV OFFリストは共通）")
         
         settings_l.addWidget(QtWidgets.QLabel("レイヤー名:"))
         settings_l.addWidget(self.layer_name_le, 1)
-        settings_l.addWidget(self.auto_matte_checkbox)
         settings_l.addWidget(self.create_each_checkbox)
         
         self.create_btn = QtWidgets.QPushButton("レンダーレイヤー作成")
@@ -363,27 +348,89 @@ class RenderLayerToolView(QtWidgets.QWidget):
         return create_box
 
     def _create_layer_management_group(self):
-        manage_box = QtWidgets.QGroupBox("既存レンダーレイヤーの管理 (自動更新)")
-        layout = QtWidgets.QHBoxLayout(manage_box)
+        manage_box = QtWidgets.QGroupBox("既存レンダーレイヤーの管理")
+        main_layout = QtWidgets.QVBoxLayout(manage_box)
+        
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QHBoxLayout(left_widget)
+        left_layout.setContentsMargins(0,0,0,0)
+        
         self.layer_list_widget = QtWidgets.QListWidget()
         self.layer_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        
         button_layout = QtWidgets.QVBoxLayout()
         self.refresh_layers_btn = QtWidgets.QPushButton("手動更新")
         self.delete_selected_btn = QtWidgets.QPushButton("選択を削除")
         self.delete_all_btn = QtWidgets.QPushButton("全て削除")
         self.delete_all_btn.setStyleSheet("background-color: #A04040;")
+        
         button_layout.addWidget(self.refresh_layers_btn)
         button_layout.addWidget(self.delete_selected_btn)
         button_layout.addStretch()
         button_layout.addWidget(self.delete_all_btn)
-        layout.addWidget(self.layer_list_widget, 1)
-        layout.addLayout(button_layout)
+        
+        left_layout.addWidget(self.layer_list_widget, 1)
+        left_layout.addLayout(button_layout)
+        
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0,0,0,0)
+        right_layout.addWidget(QtWidgets.QLabel("レイヤーの構成内容:"))
+        
+        self.layer_contents_tree = QtWidgets.QTreeWidget()
+        self.layer_contents_tree.setHeaderLabels(["オブジェクト", "コレクションタイプ"])
+        self.layer_contents_tree.setAlternatingRowColors(True)
+        right_layout.addWidget(self.layer_contents_tree, 1)
+        
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 250])
+
+        main_layout.addWidget(splitter)
         return manage_box
+
+    def populate_layer_contents_tree(self, contents_data):
+        self.layer_contents_tree.clear()
+        if not contents_data:
+            return
+
+        category_order = ["Target", "PVOff"]
+        
+        for category in category_order:
+            if category in contents_data:
+                objects = contents_data[category]
+                parent_item = QtWidgets.QTreeWidgetItem(self.layer_contents_tree)
+                parent_item.setText(0, f"{category} ({len(objects)} items)")
+                parent_item.setIcon(0, self.icons.get('collection', self.icons['default']))
+                font = parent_item.font(0)
+                font.setBold(True)
+                parent_item.setFont(0, font)
+
+                for obj_path in objects:
+                    short_name = obj_path.split('|')[-1]
+                    child_item = QtWidgets.QTreeWidgetItem(parent_item)
+                    child_item.setText(0, short_name)
+                    child_item.setText(1, category)
+                    child_item.setData(0, QtCore.Qt.UserRole, obj_path)
+                    icon = self.icons.get('geometry', self.icons['default'])
+                    child_item.setIcon(0, icon)
+
+        self.layer_contents_tree.expandAll()
+        self.layer_contents_tree.resizeColumnToContents(0)
+        self.layer_contents_tree.resizeColumnToContents(1)
 
     def set_status(self, text, color="#7EE081"):
         self.status_lbl.setText(f"<span style='color:{color}'>{text}</span>")
         
     def populate_render_layer_list(self, layer_names):
+        self.layer_list_widget.blockSignals(True)
+        selected = {item.text() for item in self.layer_list_widget.selectedItems()}
         self.layer_list_widget.clear()
         self.layer_list_widget.addItems(layer_names)
-
+        for i in range(self.layer_list_widget.count()):
+            item = self.layer_list_widget.item(i)
+            if item.text() in selected:
+                item.setSelected(True)
+        self.layer_list_widget.blockSignals(False)
