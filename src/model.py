@@ -6,7 +6,7 @@ Model層のファサード（Facade）。
 """
 import maya.cmds as cmds
 
-# --- ここから修正箇所 ---
+# Render Setup APIが利用可能かどうかのチェック
 RENDER_SETUP_API_AVAILABLE = False
 renderSetup = None  # 変数を事前に定義
 try:
@@ -16,7 +16,6 @@ try:
 except ImportError:
     # インポートに失敗した場合、APIは利用不可
     pass
-# --- 修正箇所ここまで ---
 
 
 # --- scene_query.py からの機能 ---
@@ -87,13 +86,22 @@ def delete_render_layers(layer_names_to_delete):
     指定された名前のレンダーレイヤーを削除する。
     """
     if not RENDER_SETUP_API_AVAILABLE:
+        cmds.warning("Render Setup is not available to delete layers.")
         return False
+    
+    if not layer_names_to_delete:
+        return True
+
     try:
-        rs = renderSetup.instance()
-        for layer_name in layer_names_to_delete:
-            layer = rs.getRenderLayer(layer_name)
-            if layer:
-                rs.delete(layer)
+        # 削除前に存在するレイヤー名のみをリストアップ
+        existing_layers = [name for name in layer_names_to_delete if cmds.objExists(name)]
+        
+        if not existing_layers:
+            # 削除対象が存在しない場合も成功とする
+            return True
+            
+        # Mayaの標準コマンドを使ってレイヤーノードを直接削除
+        cmds.delete(existing_layers)
         return True
     except Exception as e:
         cmds.warning(f"Failed to delete render layers: {e}")
@@ -111,3 +119,4 @@ def delete_all_render_layers():
         return True
     except Exception:
         return False
+
