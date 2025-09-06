@@ -12,6 +12,7 @@ from shiboken6 import wrapInstance
 from maya import OpenMayaUI as omui
 
 # 必要なモジュールをインポート
+#【修正】相対インポート(.)を削除し、ランチャーから直接実行できるようにする
 import view
 import model
 import controller
@@ -50,11 +51,13 @@ def run():
             except Exception as e:
                 print(f"既存ウィンドウのクローズに失敗しました: {e}")
 
-        # 依存関係の末端から順にリロード
-        importlib.reload(scene_query)
-        importlib.reload(model)
-        importlib.reload(view)
-        importlib.reload(controller)
+        # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+        # ランチャー側でアンロードを行うため、ここでのリロード処理は不要
+        # importlib.reload(scene_query)
+        # importlib.reload(model)
+        # importlib.reload(view)
+        # importlib.reload(controller)
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
         
         # ViewとControllerをインスタンス化して接続
         app_view = view.RenderLayerToolView(parent=main_window)
@@ -68,7 +71,6 @@ def run():
         _tool_instance = app_controller
 
         app_view.show()
-        print("Render Layer Tool (Rebuilt) started successfully.")
 
     except Exception as e:
         error_message = f"ツールの起動に失敗しました: {e}"
@@ -79,4 +81,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-

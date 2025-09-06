@@ -18,6 +18,9 @@ class RenderLayerToolView(QtWidgets.QWidget):
     search_text_changed = QtCore.Signal(str)
     request_apply_aov_preset = QtCore.Signal(str)
 
+    # 【新機能】選択されたレイヤーが変更されたことを通知するシグナル
+    selected_layers_changed = QtCore.Signal(list)
+
     def __init__(self, parent=None):
         super(RenderLayerToolView, self).__init__(parent)
         self.setWindowTitle("Render Layer Tool")
@@ -35,7 +38,8 @@ class RenderLayerToolView(QtWidgets.QWidget):
             'geometry': QtGui.QIcon(":/mesh.svg"),
             'group': QtGui.QIcon(":/transform.svg"),
             'other': QtGui.QIcon(":/locator.svg"),
-            'default': QtGui.QIcon(":/transform.svg")
+            'default': QtGui.QIcon(":/transform.svg"),
+            'collection': QtGui.QIcon(":/collection.svg"), # 新しいアイコン
         }
 
     def closeEvent(self, event):
@@ -71,7 +75,8 @@ class RenderLayerToolView(QtWidgets.QWidget):
         root.addWidget(self.status_lbl)
 
         self._connect_signals()
-
+    
+    # ( ... _create_scene_panel から _create_lists_panel まで変更なし ... )
     def _create_scene_panel(self):
         """シーン階層パネルの構築"""
         left_widget = QtWidgets.QWidget()
@@ -180,6 +185,15 @@ class RenderLayerToolView(QtWidgets.QWidget):
         
         self.clear_target_btn.clicked.connect(self.target_list_widget.clear)
         self.clear_pvoff_btn.clicked.connect(self.pvoff_list_widget.clear)
+
+        # 【新機能】レイヤーリストの選択変更シグナルを接続
+        self.layer_list_widget.itemSelectionChanged.connect(self._on_layer_selection_changed)
+
+    def _on_layer_selection_changed(self):
+        """レイヤーリストの選択が変更されたときにシグナルを発行する内部スロット。"""
+        selected_items = self.layer_list_widget.selectedItems()
+        layer_names = [item.text() for item in selected_items]
+        self.selected_layers_changed.emit(layer_names)
 
     def _on_tree_double_clicked(self, item, target_list_name):
         if item.data(0, QtCore.Qt.UserRole):
@@ -330,7 +344,7 @@ class RenderLayerToolView(QtWidgets.QWidget):
         self.layer_name_le.setPlaceholderText("例: RL_Character_Solo")
         
         self.auto_matte_checkbox = QtWidgets.QCheckBox("自動マット化 (Soloモード)")
-        self.auto_matte_checkbox.setChecked(True)
+        self.auto_matte_checkbox.setChecked(False)
         self.auto_matte_checkbox.setToolTip(
             "ON: 「対象リスト」と「PV OFFリスト」以外の全オブジェクトを自動的にマット化(PV Off)します。\n"
             "OFF: リスト以外のオブジェクトはそのまま表示されます。"
@@ -352,26 +366,109 @@ class RenderLayerToolView(QtWidgets.QWidget):
         return create_box
 
     def _create_layer_management_group(self):
-        manage_box = QtWidgets.QGroupBox("既存レンダーレイヤーの管理 (自動更新)")
-        layout = QtWidgets.QHBoxLayout(manage_box)
+        # --- UIの変更箇所 ---
+        manage_box = QtWidgets.QGroupBox("既存レンダーレイヤーの管理")
+        main_layout = QtWidgets.QVBoxLayout(manage_box)
+        
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        # 左側: レイヤーリストとボタン
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QHBoxLayout(left_widget)
+        left_layout.setContentsMargins(0,0,0,0)
+        
         self.layer_list_widget = QtWidgets.QListWidget()
         self.layer_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        
         button_layout = QtWidgets.QVBoxLayout()
         self.refresh_layers_btn = QtWidgets.QPushButton("手動更新")
         self.delete_selected_btn = QtWidgets.QPushButton("選択を削除")
         self.delete_all_btn = QtWidgets.QPushButton("全て削除")
         self.delete_all_btn.setStyleSheet("background-color: #A04040;")
+        
         button_layout.addWidget(self.refresh_layers_btn)
         button_layout.addWidget(self.delete_selected_btn)
         button_layout.addStretch()
         button_layout.addWidget(self.delete_all_btn)
-        layout.addWidget(self.layer_list_widget, 1)
-        layout.addLayout(button_layout)
+        
+        left_layout.addWidget(self.layer_list_widget, 1)
+        left_layout.addLayout(button_layout)
+        
+        # 右側: レイヤーコンテンツ表示ツリー
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0,0,0,0)
+        right_layout.addWidget(QtWidgets.QLabel("レイヤーの構成内容:"))
+        
+        self.layer_contents_tree = QtWidgets.QTreeWidget()
+        self.layer_contents_tree.setHeaderLabels(["オブジェクト", "コレクションタイプ"])
+        self.layer_contents_tree.setAlternatingRowColors(True)
+        right_layout.addWidget(self.layer_contents_tree, 1)
+        
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 250])
+
+        main_layout.addWidget(splitter)
         return manage_box
+
+    # --- ここから新機能 ---
+    def populate_layer_contents_tree(self, contents_data):
+        """
+        指定されたデータでレイヤー構成ツリーを更新する。
+        contents_data: {'Target': ['pCylinder1'], 'PVOff': ['pSphere1'], ...}
+        """
+        self.layer_contents_tree.clear()
+        if not contents_data:
+            return
+
+        category_order = ["Target", "PVOff", "Visible", "WorldMatte"]
+        
+        for category in category_order:
+            if category in contents_data:
+                objects = contents_data[category]
+                
+                # カテゴリ（コレクション）の親アイテム
+                parent_item = QtWidgets.QTreeWidgetItem(self.layer_contents_tree)
+                parent_item.setText(0, f"{category} ({len(objects)} items)")
+                parent_item.setIcon(0, self.icons.get('collection', self.icons['default']))
+                font = parent_item.font(0)
+                font.setBold(True)
+                parent_item.setFont(0, font)
+
+                # オブジェクトの子アイテム
+                for obj_path in objects:
+                    short_name = obj_path.split('|')[-1]
+                    child_item = QtWidgets.QTreeWidgetItem(parent_item)
+                    child_item.setText(0, short_name)
+                    child_item.setText(1, category)
+                    child_item.setData(0, QtCore.Qt.UserRole, obj_path) # フルパスを保持
+                    
+                    # アイコン設定（簡易版）
+                    icon = self.icons.get('geometry', self.icons['default'])
+                    child_item.setIcon(0, icon)
+
+        self.layer_contents_tree.expandAll()
+        self.layer_contents_tree.resizeColumnToContents(0)
+        self.layer_contents_tree.resizeColumnToContents(1)
 
     def set_status(self, text, color="#7EE081"):
         self.status_lbl.setText(f"<span style='color:{color}'>{text}</span>")
         
     def populate_render_layer_list(self, layer_names):
+        # 選択状態が変わってしまうのを防ぐため、シグナルをブロック
+        self.layer_list_widget.blockSignals(True)
+        
+        # 現在の選択を記憶
+        selected = {item.text() for item in self.layer_list_widget.selectedItems()}
+        
         self.layer_list_widget.clear()
         self.layer_list_widget.addItems(layer_names)
+        
+        # 選択を復元
+        for i in range(self.layer_list_widget.count()):
+            item = self.layer_list_widget.item(i)
+            if item.text() in selected:
+                item.setSelected(True)
+                
+        self.layer_list_widget.blockSignals(False)
