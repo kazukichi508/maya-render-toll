@@ -1,151 +1,122 @@
-# -*- coding: utf-8 -*-
 # render_layer_tool/scene_query.py
-from __future__ import annotations
+# -*- coding: utf-8 -*-
+"""
+Mayaシーンの情報を取得・整理するためのモジュール。
+"""
 import maya.cmds as cmds
-# rs_utils のインポートを削除
+import logging
 
-# --- ここから修正箇所 ---
-
-# rs_utils.py の代替となるシンプルなログ機能
-class SimpleLogger:
-    def info(self, msg): print(f"INFO: {msg}")
-    def debug(self, msg): print(f"DEBUG: {msg}")
-    def warning(self, msg): print(f"WARNING: {msg}")
-    def error(self, msg): print(f"ERROR: {msg}")
-logger = SimpleLogger()
-
-# --- 修正箇所ここまで ---
-
-def get_raw_selection():
-    """現在の選択をtransformとして返す。"""
-    return cmds.ls(sl=True, long=True, type="transform") or []
-
-def _get_node_type(node_path: str):
-    """ノードのタイプと子の有無を判定する。"""
-    shapes = cmds.listRelatives(node_path, shapes=True, noIntermediate=True, fullPath=True) or []
-    children = cmds.listRelatives(node_path, children=True, type='transform', fullPath=True) or []
-    info = {"type": "group" if children and not shapes else "other"}
-
-    if not shapes:
-        return info
-
-    shp = shapes[0]
+def get_node_type(path):
+    """ノードパスからノードタイプを推測し、Viewのアイコン表示用に分類する。"""
     try:
-        inh = cmds.nodeType(shp, inherited=True) or []
-    except Exception:
-        inh = []
-
-    if "camera" in inh:
-        try:
-            if not cmds.camera(node_path, q=True, startupCamera=True):
-                info["type"] = "camera"
-                return info
-        except Exception: pass
-        return None 
-
-    if "light" in inh or "aiLight" in inh:
-        info["type"] = "light"
-        return info
-    
-    if "locator" in inh:
-        info["type"] = "other"
-        return info
-
-    if 'geometry' in inh or cmds.nodeType(shp) == 'mesh':
-        info["type"] = "geometry"
-
-    return info
-
-def get_categorized_scene_hierarchy():
-    """UIツリー用に「グループ」「オブジェクト」「その他」の3つにカテゴリ分けされた階層データを構築する。"""
-    logger.debug("Building scene hierarchy...")
-    
-    categorized_hierarchy = {
-        "groups": {},
-        "objects": {},
-        "other": {}
-    }
-
-    def build_full_hierarchy(node_path):
-        node_info = _get_node_type(node_path)
-        if node_info is None:
-            return None
-
-        node_data = {"type": node_info["type"], "children": {}}
+        if not cmds.objExists(path):
+            return 'default'
         
-        children = cmds.listRelatives(node_path, children=True, type="transform", fullPath=True) or []
-        for child in children:
-            child_data = build_full_hierarchy(child)
-            if child_data:
-                node_data["children"][child] = child_data
+        # トランスフォームノードの場合、シェイプを確認する
+        if cmds.objectType(path, isType='transform'):
+            # 中間オブジェクトを除いたシェイプを取得
+            shapes = cmds.listRelatives(path, shapes=True, fullPath=True, noIntermediate=True)
+            if shapes:
+                shape_type = cmds.nodeType(shapes[0])
+                if shape_type in ['mesh', 'nurbsSurface', 'subdiv']:
+                    return 'geometry'
+                elif 'camera' in shape_type:
+                    return 'camera'
+                # Arnoldなどの外部レンダラのライトも考慮
+                elif 'light' in shape_type or 'Light' in shape_type:
+                    return 'light'
+            
+            # シェイプを持たず、子トランスフォームがある場合はグループとみなす
+            if cmds.listRelatives(path, children=True, type='transform', fullPath=True):
+                return 'group'
         
-        return node_data
+        return 'other'
+    except Exception as e:
+        logging.warning(f"Error determining node type for {path}: {e}")
+        return 'default'
 
-    root_nodes = cmds.ls(assemblies=True, long=True) or []
-    ignore_list = {"|persp", "|top", "|front", "|side", "|defaultLightSet", "|defaultObjectSet"}
+def is_renderable(path):
+    """ノードがレンダリング対象（ジオメトリやライト）であるかを判定する。"""
+    node_type = get_node_type(path)
+    return node_type in ['geometry', 'light']
 
-    for root in root_nodes:
-        if root in ignore_list:
+def get_scene_hierarchy():
+    """
+    シーン内の主要なオブジェクトの階層構造を取得し、View用に分類する。
+    """
+    # トップレベルのDAGノードを取得
+    all_assemblies = cmds.ls(assemblies=True, long=True)
+    
+    # 標準カメラを除外
+    std_cameras = set(['|persp', '|top', '|front', '|side'])
+    
+    hierarchy = {"groups": {}, "objects": {}, "other": {}}
+
+    def build_hierarchy_recursive(path, parent_dict):
+        if not cmds.objExists(path):
+            return
+
+        node_data = {}
+        node_type = get_node_type(path)
+        node_data['type'] = node_type
+        
+        # 子のトランスフォームノードを取得して再帰処理
+        children = cmds.listRelatives(path, children=True, fullPath=True, type='transform')
+        if children:
+            node_data['children'] = {}
+            for child in children:
+                 build_hierarchy_recursive(child, node_data['children'])
+
+        parent_dict[path] = node_data
+
+    # トップレベルノードを分類して階層構築
+    for assembly in all_assemblies:
+        if assembly in std_cameras:
             continue
 
-        hierarchy_data = build_full_hierarchy(root)
-
-        if hierarchy_data:
-            root_type = hierarchy_data["type"]
+        if is_renderable(assembly):
+            category = "objects"
+        elif get_node_type(assembly) == 'group':
+            category = "groups"
+        else:
+            category = "other"
             
-            if root_type == "group":
-                categorized_hierarchy["groups"][root] = hierarchy_data
-            elif root_type in ["geometry", "light", "camera"]:
-                categorized_hierarchy["objects"][root] = hierarchy_data
-            else:
-                categorized_hierarchy["other"][root] = hierarchy_data
+        if assembly not in hierarchy[category]:
+            build_hierarchy_recursive(assembly, hierarchy[category])
+
+    return hierarchy
+
+def get_selected_paths():
+    """現在選択されているオブジェクトのフルパスリストを取得する。"""
+    return cmds.ls(selection=True, long=True) or []
+
+def resolve_selection(paths, expand_groups=True):
+    """指定されたパスリストを解決する。
+       expand_groupsがTrueの場合、グループを展開して子孫のレンダリング可能ノードを取得する。
+    """
+    resolved = set()
     
-    logger.debug(f"Categorized hierarchy complete.")
-    return categorized_hierarchy
+    if not expand_groups:
+        # 展開しない場合は、選択されたノード（グループ含む）をそのまま追加
+        for path in paths:
+            if cmds.objExists(path):
+                resolved.add(path)
+        return list(resolved)
 
-def get_renderable_descendants(root_node: str):
-    """指定ノード配下のレンダリング可能なジオメトリを列挙する。"""
-    out = set()
-    def is_geom(node: str) -> bool:
-        s = cmds.listRelatives(node, shapes=True, noIntermediate=True, fullPath=True) or []
-        if not s: return False
-        try:
-            inh = cmds.nodeType(s[0], inherited=True) or []
-            return "camera" not in inh and "light" not in inh and "aiLight" not in inh
-        except Exception:
-            return False
-
-    if is_geom(root_node):
-        out.add(root_node)
-
-    descendants = cmds.listRelatives(root_node, allDescendents=True, type="transform", fullPath=True) or []
-    for ch in descendants:
-        if is_geom(ch):
-            out.add(ch)
-    return list(out)
-
-def get_all_renderable_shapes_in_scene():
-    """シーン内のレンダリング対象シェイプ（カメラ/ライト除外）を返す。"""
-    all_shapes = cmds.ls(type="shape", long=True, noIntermediate=True) or []
-    renderable = []
-    cache = {}
-    for shp in all_shapes:
-        try:
-            nt = cmds.nodeType(shp)
-            if nt not in cache:
-                try: cache[nt] = cmds.nodeType(nt, inherited=True) or []
-                except: cache[nt] = []
+    # 展開する場合
+    for path in paths:
+        if not cmds.objExists(path):
+            continue
+        
+        # 自身がレンダリング可能なら追加
+        if is_renderable(path):
+            resolved.add(path)
             
-            inh = cache[nt]
-            if "camera" in inh or "light" in inh or "aiLight" in inh:
-                continue
-            renderable.append(shp)
-        except Exception:
-            pass
-    return renderable
-
-def get_shapes_from_transforms(transform_nodes: list[str]) -> list[str]:
-    """トランスフォームノードリストから関連するシェイプを返す。"""
-    if not transform_nodes: return []
-    shapes = cmds.listRelatives(transform_nodes, shapes=True, noIntermediate=True, fullPath=True, allDescendents=True) or []
-    return sorted(list(set(shapes)))
+        # 子孫を探索（トランスフォームノードのみ対象）
+        descendants = cmds.listRelatives(path, allDescendents=True, fullPath=True, type='transform') or []
+        for desc in descendants:
+            if is_renderable(desc):
+                resolved.add(desc)
+                
+    # パスが短い順にソートして返す
+    return sorted(list(resolved), key=lambda x: len(x.split('|')))

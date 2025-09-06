@@ -1,358 +1,381 @@
-# -*- coding: utf-8 -*-
 # render_layer_tool/controller.py
-
-from PySide6 import QtWidgets, QtCore, QtGui
-import re
-import model
+# -*- coding: utf-8 -*-
 import maya.cmds as cmds
-import maya.OpenMaya as om
+import maya.OpenMaya as om # Maya Callback用 (OpenMaya 1.0)
+import maya.utils as cmds_utils # executeDeferred用
+import logging
+import traceback
+from PySide6 import QtCore, QtWidgets
 
-# --- ここから修正箇所 ---
+# 依存モジュールのインポート
+import model
+import scene_query
 
-class SimpleLogger:
-    def info(self, msg): print(f"INFO: {msg}")
-    def debug(self, msg): print(f"DEBUG: {msg}")
-    def warning(self, msg): print(f"WARNING: {msg}")
-    def error(self, msg): print(f"ERROR: {msg}")
-logger = SimpleLogger()
-
-RENDER_SETUP_API_AVAILABLE = False
-renderSetup = None # 変数を事前に定義
+# Render Setup API (コールバック解除用)
 try:
-    from maya.app.renderSetup.model import renderSetup
-    RENDER_SETUP_API_AVAILABLE = True
+    import maya.app.renderSetup.model.renderSetup as rs
 except ImportError:
-    pass
+    rs = None
 
-if not RENDER_SETUP_API_AVAILABLE:
-    logger.warning("Render Setup API not available. The tool may not function correctly.")
-
-# --- 修正箇所ここまで ---
-
-
-class RenderLayerToolController:
-    """ViewとModelをつなぐコントローラー。"""
+class RenderLayerToolController(QtCore.QObject):
+    """
+    ViewとModel間のインタラクションを制御し、シーンの変更を監視します。
+    """
     def __init__(self, view_instance):
+        super(RenderLayerToolController, self).__init__()
         self.view = view_instance
-        self._script_jobs = []
-        self._callback_ids = []
-        self._rs_callbacks = {}
-        self._is_syncing_selection = False
-
-        self.tree_refresh_timer = QtCore.QTimer()
-        self.tree_refresh_timer.setSingleShot(True)
-        self.tree_refresh_timer.setInterval(250)
-
-        self._connect()
-        self._install_callbacks()
-        self.populate_tree()
-        self.refresh_layer_management_list()
         
-        logger.info("Controller initialized successfully.")
+        try:
+            self.model = model.RenderLayerManager()
+        except EnvironmentError as e:
+            self.view.set_status(f"初期化失敗: {e}", color="#E57373")
+            self.model = None
+            return
+        
+        self.callbacks = []
+        self.structure_change_timer = QtCore.QTimer()
+        self.structure_change_timer.setSingleShot(True)
+        self.structure_change_timer.setInterval(500) # 500ms遅延
+        
+        # Observer管理用フラグ。Trueの間はObserverが反応しない。
+        self.is_processing_layers = False 
+        # 【エラー修正】Undoチャンク状態管理フラグ
+        self.undo_chunk_open = False
+        
+        self._connect_signals()
+        self._register_callbacks()
+        self._initialize_ui()
 
-    def _connect(self):
+    # (中略: _connect_signals, _initialize_ui, _register_callbacks, cleanup, Callback Handlers は変更なし)
+
+    def _connect_signals(self):
         v = self.view
-        v.request_populate_tree.connect(self._trigger_tree_refresh)
-        v.request_add_to_target.connect(self._on_add_to_list)
-        v.request_remove_from_target.connect(self._on_remove_from_list)
-        v.request_create_layer.connect(self._on_create_layer)
-        v.request_layer_list_refresh.connect(self.refresh_layer_management_list)
-        v.request_delete_selected_layers.connect(self._on_delete_selected_layers)
-        v.request_delete_all_layers.connect(self._on_delete_all_layers)
+        v.request_populate_tree.connect(self.populate_scene_tree)
+        v.search_text_changed.connect(self.view.filter_scene_tree)
+        self.structure_change_timer.timeout.connect(self.populate_scene_tree)
+        v.request_add_to_target.connect(self.add_to_target_list)
+        v.request_remove_from_target.connect(self.remove_from_target_list)
+        v.request_create_layer.connect(self.handle_create_layer)
+        v.request_layer_list_refresh.connect(self.refresh_render_layer_list)
+        v.request_delete_selected_layers.connect(self.handle_delete_selected_layers)
+        v.request_delete_all_layers.connect(self.handle_delete_all_layers)
+        v.request_apply_aov_preset.connect(self._apply_aov_preset)
         v.widget_closed.connect(self.cleanup)
-        v.scene_objects_tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
-        v.search_text_changed.connect(self.filter_tree)
-        v.request_apply_aov_preset.connect(self.apply_aov_preset)
 
+    def _initialize_ui(self):
+        self.populate_scene_tree()
+        self.refresh_render_layer_list()
+        self._apply_aov_preset("Basic")
+        self.view.set_status("準備完了。")
+
+    def _register_callbacks(self):
         try:
-            for widget in [v.target_list_widget, v.pvoff_list_widget]:
-                widget.model().rowsInserted.connect(self._suggest_layer_name)
-                widget.model().rowsRemoved.connect(self._suggest_layer_name)
-        except AttributeError:
-            logger.warning("Could not connect list widgets for layer name suggestion.")
-
-        self.tree_refresh_timer.timeout.connect(self.populate_tree)
-        logger.debug("UI signals connected.")
-
-    def show(self):
-        self.view.show()
-
-    def _install_callbacks(self):
-        logger.info("Installing callbacks.")
-        events = ["DagObjectCreated", "NameChanged", 'Undo', 'Redo', 'parent']
-        for event in events:
-            try:
-                job_id = cmds.scriptJob(event=[event, self._trigger_tree_refresh], protected=True)
-                self._script_jobs.append(job_id)
-            except Exception as e:
-                logger.warning(f"Failed to install ScriptJob for event '{event}': {e}")
-        try:
-            job_id = cmds.scriptJob(ct=["delete", self._trigger_tree_refresh], protected=True)
-            self._script_jobs.append(job_id)
+            cb_id = om.MEventMessage.addEventCallback("SelectionChanged", self._on_selection_changed)
+            self.callbacks.append(cb_id)
+            cb_id = om.MEventMessage.addEventCallback("DagObjectCreated", lambda *args: self.structure_change_timer.start())
+            self.callbacks.append(cb_id)
+            cb_id = om.MEventMessage.addEventCallback("NameChanged", lambda *args: self.structure_change_timer.start())
+            self.callbacks.append(cb_id)
+            if rs:
+                obs_added = rs.addRenderSetupObserver(rs.kLayerAdded, self._on_render_setup_changed)
+                self.callbacks.append((rs.kLayerAdded, obs_added))
+                obs_removed = rs.addRenderSetupObserver(rs.kLayerRemoved, self._on_render_setup_changed)
+                self.callbacks.append((rs.kLayerRemoved, obs_removed))
         except Exception as e:
-            logger.warning(f"Failed to install ScriptJob for 'delete': {e}")
-        try:
-            cb_id = om.MEventMessage.addEventCallback("SelectionChanged", self._on_maya_selection_changed)
-            self._callback_ids.append(cb_id)
-        except Exception as e:
-            logger.error(f"Failed to install selection callback (MEventMessage): {e}")
-        if RENDER_SETUP_API_AVAILABLE and renderSetup:
-            try:
-                rs = renderSetup.instance()
-                if rs:
-                    self._rs_callbacks = {'add': self._on_render_setup_changed, 'remove': self._on_render_setup_changed}
-                    rs.renderLayers.add.connect(self._rs_callbacks['add'])
-                    rs.renderLayers.remove.connect(self._rs_callbacks['remove'])
-            except Exception as e:
-                logger.warning(f"Failed to setup Render Setup callbacks: {e}.")
+            logging.error(f"コールバックの登録に失敗しました: {e}")
 
     def cleanup(self):
-        logger.info("Cleaning up callbacks and resources.")
-        for job_id in self._script_jobs:
-            try:
-                if cmds.scriptJob(exists=job_id): cmds.scriptJob(kill=job_id, force=True)
-            except Exception: pass
-        self._script_jobs = []
-        for cb_id in self._callback_ids:
-            try: om.MMessage.removeCallback(cb_id)
-            except Exception: pass
-        self._callback_ids = []
-        if RENDER_SETUP_API_AVAILABLE and renderSetup and self._rs_callbacks:
-            try:
-                rs = renderSetup.instance()
-                if rs:
-                    rs.renderLayers.add.disconnect(self._rs_callbacks['add'])
-                    rs.renderLayers.remove.disconnect(self._rs_callbacks['remove'])
-            except Exception: pass
-        if self.tree_refresh_timer.isActive(): self.tree_refresh_timer.stop()
-        logger.info("Cleanup complete.")
+        if self.callbacks:
+            for cb_info in self.callbacks:
+                try:
+                    if isinstance(cb_info, (int, om.MCallbackId)):
+                         om.MMessage.removeCallback(cb_info)
+                    elif rs and isinstance(cb_info, tuple) and len(cb_info) == 2:
+                         rs.removeRenderSetupObserver(cb_info[0], cb_info[1])
+                except RuntimeError:
+                    pass
+            self.callbacks = []
 
-    def _on_render_setup_changed(self, *args, **kwargs):
-        QtCore.QTimer.singleShot(50, self.refresh_layer_management_list)
+    def _on_selection_changed(self, *args):
+        selected_paths = scene_query.get_selected_paths()
+        QtCore.QTimer.singleShot(0, lambda: self.view.sync_tree_selection(selected_paths))
 
-    def _trigger_tree_refresh(self, *args, **kwargs):
-        self.tree_refresh_timer.start()
+    def _on_render_setup_changed(self, *args):
+        if self.is_processing_layers:
+            return
+        QtCore.QTimer.singleShot(200, self.refresh_render_layer_list)
 
-    def populate_tree(self, *args, **kwargs):
-        logger.debug("Executing populate_tree.")
-        categorized_hierarchy = model.get_categorized_scene_hierarchy()
-        try:
-            self.view.populate_scene_tree_hierarchy(categorized_hierarchy)
-        except AttributeError:
-            logger.warning("View methods for tree population missing.")
-        self._on_maya_selection_changed()
+    # --- Render Layer Operations (レイヤー作成・削除) ---
 
-    def filter_tree(self, text):
-        try: self.view.filter_scene_tree(text)
-        except AttributeError: pass
+    def handle_create_layer(self):
+        if not self.model: return
+        self.view.set_status("レイヤー作成を開始しています...")
+        cmds_utils.executeDeferred(self._execute_create_layer)
 
-    def _on_maya_selection_changed(self, *args, **kwargs):
-        if self._is_syncing_selection: return
-        self._is_syncing_selection = True
-        try:
-            self.view.scene_objects_tree.blockSignals(True)
-            current_selection = model.get_raw_selection()
-            self.view.sync_tree_selection(current_selection)
-        except AttributeError:
-             logger.warning("View methods for selection sync missing.")
-        finally:
-            try: self.view.scene_objects_tree.blockSignals(False)
-            except AttributeError: pass
-            self._is_syncing_selection = False
+    def _execute_create_layer(self):
+        """レイヤー作成の実行処理。(Undo対応・安定化)"""
+        if self.is_processing_layers:
+             self.view.set_status("エラー: 別のレイヤー操作が実行中です。", "#E57373")
+             return
 
-    def _on_tree_selection_changed(self):
-        if self._is_syncing_selection: return
-        self._is_syncing_selection = True
-        try:
-            selected_items = self.view.scene_objects_tree.selectedItems()
-            paths = [it.data(0, QtCore.Qt.UserRole) for it in selected_items if it.data(0, QtCore.Qt.UserRole)]
-            if paths:
-                valid_paths = [p for p in paths if cmds.objExists(p)]
-                if valid_paths: cmds.select(valid_paths, r=True)
-                else: cmds.select(cl=True)
-            elif not selected_items: cmds.select(cl=True)
-        except AttributeError:
-             logger.warning("View methods for selection sync missing.")
-        finally:
-            self._is_syncing_selection = False
+        # Viewから現在の設定を取得
+        layer_name_input = self.view.layer_name_le.text().strip()
+        settings = {
+            'auto_matte': self.view.auto_matte_checkbox.isChecked(),
+            'create_each': self.view.create_each_checkbox.isChecked(),
+            'aov_settings': self.view.get_aov_settings()
+        }
+        target_objects = self._get_objects_from_list(self.view.target_list_widget)
+        pvoff_objects = self._get_objects_from_list(self.view.pvoff_list_widget)
 
-    def _get_list_widgets(self, list_name):
-        try:
-            if list_name == 'target':
-                return self.view.target_list_widget, self.view.pvoff_list_widget
-            elif list_name == 'pvoff':
-                return self.view.pvoff_list_widget, self.view.target_list_widget
-        except AttributeError:
-            logger.warning("List widgets missing in View.")
-        return None, None
-
-    def _get_all_items(self, list_widget):
-        if not list_widget: return []
-        return [list_widget.item(i).text() for i in range(list_widget.count())]
-        
-    def _on_add_to_list(self, list_name):
-        target_list, other_list = self._get_list_widgets(list_name)
-        if not target_list: return
-
-        selected_tree_items = self.view.scene_objects_tree.selectedItems()
-        if not selected_tree_items:
-            self.view.set_status("シーンツリーからオブジェクトを選択してください。", "#C8C000")
+        if not target_objects and not pvoff_objects:
+            self.view.set_status("エラー: リストに有効なオブジェクトがありません。", "#E57373")
             return
 
-        expand_children = self.view.expand_groups_radio.isChecked()
+        # レイヤー作成実行 (Undoチャンク開始)
+        # 【エラー修正】フラグ管理を使用して安全に開く
+        self._safe_open_chunk("Create Render Layers")
         
-        items_to_process = set()
-        for item in selected_tree_items:
-            node_path = item.data(0, QtCore.Qt.UserRole)
-            if not node_path: continue
+        success = False
+        
+        # Observerを一時停止
+        self.is_processing_layers = True
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        
+        try:
+            self.view.set_status("レイヤー作成中... (Render Setup API実行中)")
 
-            if expand_children:
-                items_to_process.update(model.get_renderable_descendants(node_path))
+            # Modelに作成を依頼
+            created_count = self.model.create_render_layers(
+                layer_name_input, target_objects, pvoff_objects, settings
+            )
+            
+            # 結果報告
+            if created_count > 0:
+                self.view.set_status(f"成功: {created_count} 個のレンダーレイヤーを作成しました。（重複名は自動連番）", "#7EE081")
+                success = True
             else:
-                items_to_process.add(node_path)
-        
-        if not items_to_process:
-            self.view.set_status("追加対象のオブジェクトが見つかりませんでした。", "orange")
-            return
+                 self.view.set_status("情報: レイヤーは作成されませんでした（詳細はスクリプトエディタ参照）。", "#FFB74D")
 
-        target_items_set = set(self._get_all_items(target_list))
-        other_items_set = set(self._get_all_items(other_list))
-        
-        items_to_move = items_to_process.intersection(other_items_set)
-        newly_added_items = items_to_process - target_items_set - other_items_set
-
-        if not newly_added_items and not items_to_move:
-            self.view.set_status("選択されたアイテムは既に追加されています。", "#C8C000")
-            return
-
-        target_list.blockSignals(True)
-        other_list.blockSignals(True)
-        try:
-            if items_to_move:
-                current_other_items = self._get_all_items(other_list)
-                other_list.clear()
-                other_list.addItems(sorted(list(set(current_other_items) - items_to_move)))
-
-            final_target_items = sorted(list(target_items_set.union(items_to_process)))
-            target_list.clear()
-            target_list.addItems(final_target_items)
+        except ValueError as e:
+            self.view.set_status(f"入力エラー: {e}", "#E57373")
+            self._safe_undo()
+        except Exception as e:
+            self.view.set_status(f"致命的なエラーが発生しました: {e}", "#E57373")
+            traceback.print_exc()
+            self._safe_undo()
         finally:
-            target_list.blockSignals(False)
-            other_list.blockSignals(False)
-            self._suggest_layer_name()
-
-        count = len(newly_added_items) + len(items_to_move)
-        self.view.set_status(f"{count} 件のアイテムを追加/移動しました。", "#7EE081")
-
-    def _on_remove_from_list(self, list_name):
-        target_list, _ = self._get_list_widgets(list_name)
-        if not target_list:
-            logger.warning(f"Remove operation failed: Could not find list widget for '{list_name}'.")
-            return
-
-        items_to_remove = target_list.selectedItems()
-        if not items_to_remove:
-            self.view.set_status("リストから削除するアイテムを選択してください。", "#C8C000")
-            return
-        
-        for item in items_to_remove:
-            row = target_list.row(item)
-            if row != -1:
-                target_list.takeItem(row)
-        
-        self.view.set_status(f"{len(items_to_remove)} 件のアイテムをリストから戻しました。")
-
-    def _suggest_layer_name(self):
-        target_items = self._get_all_items(self.view.target_list_widget)
-        if not target_items:
-            if self.view.layer_name_le.text().startswith("RL_"):
-                self.view.layer_name_le.setText("")
-            return
-
-        base_name = target_items[0].split('|')[-1]
-        cleaned_name = re.sub(r'[^a-zA-Z0-9_]', '_', base_name)
-        suggested = f"RL_{cleaned_name}"
-        if len(target_items) > 1:
-            suggested += "_Group"
-        
-        if self.view.layer_name_le.text().startswith("RL_") or not self.view.layer_name_le.text():
-            self.view.layer_name_le.setText(suggested)
-
-    def _on_create_layer(self):
-        layer_name = self.view.layer_name_le.text().strip()
-        target_items = self._get_all_items(self.view.target_list_widget)
-
-        if not target_items:
-            self.view.set_status("「レンダリング対象」リストにオブジェクトを追加してください。", "orange")
-            return
-        if not layer_name:
-            self.view.set_status("レイヤー名を入力してください。", "orange")
-            return
-
-        success = model.create_render_layer(
-            layer_name=layer_name,
-            target_objects=target_items
-        )
+            # Undoチャンクを安全に閉じる
+            self._safe_close_chunk()
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.is_processing_layers = False
 
         if success:
-            self.view.set_status(f"レイヤー '{layer_name}' を作成/更新しました。", "lightgreen")
-        else:
-            self.view.set_status(f"レイヤー '{layer_name}' の作成に失敗しました。", "red")
-        
-        self.refresh_layer_management_list()
+            QtCore.QTimer.singleShot(50, self.refresh_render_layer_list)
 
-    def apply_aov_preset(self, preset_name):
-        presets = {
-            "Basic": ["diffuse", "specular", "id", "N", "P", "AO"],
-            "Full Beauty": ["diffuse", "specular", "coat", "transmission", "sss", "volume", "emission", "background"],
-            "Utility": ["id", "shadow_matte", "N", "P", "AO"],
-            "Clear": []
-        }
-        aovs_to_set = presets.get(preset_name, [])
-        self.view.set_aov_checkboxes(aovs_to_set)
-        self.view.set_status(f"AOVプリセット '{preset_name}' を適用しました。")
-
-    def refresh_layer_management_list(self):
-        logger.debug("Executing refresh_layer_management_list.")
+    def refresh_render_layer_list(self):
+        # (変更なし)
+        if not self.model: return
         try:
-            selected_layers = [item.text() for item in self.view.layer_list_widget.selectedItems()]
-            layers = model.get_all_render_layers()
-            self.view.populate_render_layer_list(layers)
-            for i in range(self.view.layer_list_widget.count()):
-                item = self.view.layer_list_widget.item(i)
-                if item.text() in selected_layers:
-                    item.setSelected(True)
-        except AttributeError:
-            logger.warning("View methods for layer management missing.")
+            self.view.layer_list_widget.blockSignals(True)
+            layer_names = self.model.list_render_layers()
+            self.view.populate_render_layer_list(layer_names)
+        except Exception as e:
+            logging.error(f"レイヤーリスト更新エラー: {e}")
+        finally:
+            try:
+                if self.view.layer_list_widget:
+                     self.view.layer_list_widget.blockSignals(False)
+            except RuntimeError:
+                pass
 
-    def _on_delete_selected_layers(self):
-        try:
-            layer_names = [item.text() for item in self.view.layer_list_widget.selectedItems()]
-        except AttributeError:
-             logger.error("Cannot access layer_list_widget in View.")
-             return
+    def handle_delete_selected_layers(self):
+        # (変更なし)
+        if not self.model: return
+        selected_items = self.view.layer_list_widget.selectedItems()
+        if not selected_items:
+            self.view.set_status("削除するレイヤーを選択してください。", "#FFB74D")
+            return
+
+        layer_names = [item.text() for item in selected_items]
+        reply = QtWidgets.QMessageBox.question(self.view, '確認',
+                                               f"選択した {len(layer_names)} 個のレイヤーを削除しますか？",
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                                               QtWidgets.QMessageBox.No)
+
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.view.set_status("レイヤー削除を開始しています...")
+            cmds_utils.executeDeferred(lambda: self._execute_delete_layers(layer_names))
+
+    def handle_delete_all_layers(self):
+        # (変更なし)
+        if not self.model: return
+        layer_names = self.model.list_render_layers()
         if not layer_names:
-            self.view.set_status("削除するレイヤーをリストから選択してください。", "#C8C000")
+            self.view.set_status("削除するレイヤーがありません。")
             return
+
+        reply = QtWidgets.QMessageBox.warning(self.view, '警告',
+                                               "全てのレンダーレイヤー（Master Layer以外）を削除します。よろしいですか？",
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                                               QtWidgets.QMessageBox.No)
+
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.view.set_status("全レイヤー削除を開始しています...")
+            cmds_utils.executeDeferred(lambda: self._execute_delete_layers(layer_names))
+
+    def _execute_delete_layers(self, layer_names):
+        """レイヤー削除の実行処理 (Undo対応・安定化)"""
+        if self.is_processing_layers:
+             self.view.set_status("エラー: 別のレイヤー操作が実行中です。", "#E57373")
+             return
+             
+        # Undoチャンク開始
+        # 【エラー修正】フラグ管理を使用して安全に開く
+        self._safe_open_chunk("Delete Render Layers")
         
-        reply = QtWidgets.QMessageBox.question(self.view, '削除の確認', f"{len(layer_names)} 件のレイヤーを削除しますか？", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
-        if reply == QtWidgets.QMessageBox.Yes:
-            if model.delete_render_layers(layer_names):
-                self.view.set_status(f"{len(layer_names)} 件のレイヤーを削除しました。", "#7EE081")
-            else:
-                self.view.set_status("レイヤーの削除に失敗しました。", "red")
-            self.refresh_layer_management_list()
+        success = False
+        
+        # Observerを一時停止
+        self.is_processing_layers = True
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        
+        try:
+            self.view.set_status("レイヤー削除中... (Render Setup API実行中)")
+            deleted_count = self.model.delete_multiple_layers(layer_names)
+            
+            if deleted_count > 0:
+                success = True
 
-    def _on_delete_all_layers(self):
-        all_layers = model.get_all_render_layers()
-        if not all_layers:
-            self.view.set_status("削除するレンダーレイヤーがありません。", "#C8C000")
+            if deleted_count == len(layer_names):
+                self.view.set_status(f"{deleted_count}個のレイヤーを削除しました。", "#7EE081")
+            else:
+                self.view.set_status(f"{len(layer_names)}個中{deleted_count}個のレイヤーを削除しました。一部失敗しました。", "#FFB74D")
+
+        except Exception as e:
+            self.view.set_status(f"削除エラー: {e}", "#E57373")
+            self._safe_undo()
+        finally:
+            # Undoチャンクを安全に閉じる
+            self._safe_close_chunk()
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.is_processing_layers = False
+        
+        if success:
+            QtCore.QTimer.singleShot(50, self.refresh_render_layer_list)
+
+    # --- Undo Helpers (修正箇所) ---
+    
+    def _safe_open_chunk(self, chunk_name):
+        """Undoチャンクを安全に開く。"""
+        if self.undo_chunk_open:
+             logging.warning("Attempted to open a new Undo chunk while one is already open. Closing previous one.")
+             self._safe_close_chunk()
+        cmds.undoInfo(openChunk=True, chunkName=chunk_name)
+        self.undo_chunk_open = True
+
+    def _safe_undo(self):
+        """Undoチャンクを安全に閉じてからUndoを実行する。"""
+        self._safe_close_chunk()
+        try:
+            # Undoが有効な場合のみ実行
+            if cmds.undoInfo(q=True, state=True):
+                cmds.undo()
+        except Exception as e:
+            logging.error(f"Undo操作に失敗しました: {e}")
+
+    def _safe_close_chunk(self):
+        """Undoチャンクが開いている場合のみ閉じる。(フラグ管理版)"""
+        # cmds.undoInfo(query=True) を使わず、Python側のフラグで管理する
+        if self.undo_chunk_open:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception as e:
+                 logging.error(f"Undoチャンクのクローズに失敗しました: {e}")
+            finally:
+                # 成功・失敗に関わらずフラグは下ろす
+                self.undo_chunk_open = False
+
+    # --- AOV Management & List Management (変更なし・参考用に再掲) ---
+    
+    def _apply_aov_preset(self, preset_name):
+        if not self.model: return
+        target_aovs = self.model.get_aov_preset(preset_name)
+        self.view.set_aov_checkboxes(target_aovs)
+        self.view.set_status(f"AOVプリセット '{preset_name}' を適用しました。")
+    
+    def populate_scene_tree(self):
+        try:
+            hierarchy_data = scene_query.get_scene_hierarchy()
+            self.view.populate_scene_tree_hierarchy(hierarchy_data)
+            current_filter = self.view.search_le.text()
+            if current_filter:
+                self.view.filter_scene_tree(current_filter)
+            self._on_selection_changed()
+        except Exception as e:
+            self.view.set_status(f"ツリー更新エラー: {e}", color="#E57373")
+            traceback.print_exc()
+
+    def _get_list_widgets(self, list_name):
+        if list_name == 'target':
+            return self.view.target_list_widget, self.view.pvoff_list_widget
+        else:
+            return self.view.pvoff_list_widget, self.view.target_list_widget
+
+    def add_to_target_list(self, list_name):
+        target_list_widget, other_list_widget = self._get_list_widgets(list_name)
+        selected_items = self.view.scene_objects_tree.selectedItems()
+        paths_to_add = [item.data(0, QtCore.Qt.UserRole) for item in selected_items if item.data(0, QtCore.Qt.UserRole)]
+        
+        if not paths_to_add: return
+        
+        expand_groups = self.view.expand_groups_radio.isChecked()
+        final_paths = scene_query.resolve_selection(paths_to_add, expand_groups)
+
+        if not final_paths:
+            self.view.set_status("選択範囲に有効なオブジェクトが見つかりません。", color="#FFB74D")
             return
 
-        reply = QtWidgets.QMessageBox.warning(self.view, '最終確認', "全てのレンダーレイヤーを削除します。\nこの操作は元に戻せません。よろしいですか？", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
-        if reply == QtWidgets.QMessageBox.Yes:
-            if model.delete_all_render_layers():
-                self.view.set_status("全てのレンダーレイヤーを削除しました。", "#7EE081")
-            else:
-                self.view.set_status("全レイヤーの削除に失敗しました。", "red")
-            self.refresh_layer_management_list()
+        added_count = 0; moved_count = 0
+        current_target_paths = {target_list_widget.item(i).data(QtCore.Qt.UserRole) for i in range(target_list_widget.count())}
+
+        for path in final_paths:
+            short_name = path.split('|')[-1]
+            if path not in current_target_paths:
+                is_moved = False
+                for i in range(other_list_widget.count() -1, -1, -1):
+                    if other_list_widget.item(i).data(QtCore.Qt.UserRole) == path:
+                        other_list_widget.takeItem(i)
+                        is_moved = True; moved_count += 1
+                        break
+                
+                item = QtWidgets.QListWidgetItem(short_name)
+                item.setData(QtCore.Qt.UserRole, path)
+                target_list_widget.addItem(item)
+                current_target_paths.add(path)
+
+                if not is_moved: added_count += 1
+
+        status_msg = f"{list_name.upper()}リスト更新: "
+        if added_count > 0: status_msg += f"{added_count}件追加"
+        if moved_count > 0:
+            if added_count > 0: status_msg += ", "
+            status_msg += f"{moved_count}件移動"
+        if added_count == 0 and moved_count == 0: status_msg = "リストは最新です。"
+        self.view.set_status(status_msg)
+
+    def remove_from_target_list(self, list_name):
+        target_list_widget, _ = self._get_list_widgets(list_name)
+        selected_items = target_list_widget.selectedItems()
+        if not selected_items: return
+        for item in selected_items:
+            target_list_widget.takeItem(target_list_widget.row(item))
+        self.view.set_status(f"{len(selected_items)}個のアイテムを{list_name.upper()}リストから削除しました。")
+
+    def _get_objects_from_list(self, list_widget):
+        objects = []
+        for i in range(list_widget.count()):
+            path = list_widget.item(i).data(QtCore.Qt.UserRole)
+            if path and cmds.objExists(path):
+                objects.append(path)
+        return objects

@@ -11,15 +11,13 @@ from PySide6 import QtWidgets
 from shiboken6 import wrapInstance
 from maya import OpenMayaUI as omui
 
-# --- 修正箇所 ---
-# モジュールのインポート順を整理
-import scene_query
-import model
+# 必要なモジュールをインポート
 import view
+import model
 import controller
-# ----------------
+import scene_query
 
-TOOL_OBJECT_NAME = "RenderLayerTool_MainInstance_v2"
+TOOL_OBJECT_NAME = "RenderLayerTool_MainInstance_v3"
 
 _tool_instance = None
 
@@ -41,9 +39,10 @@ def run():
         if not main_window:
             raise RuntimeError("Mayaのメインウィンドウが見つかりません。GUIモードで実行してください。")
         
+        # 既存のウィンドウを検索して閉じる
         for child in main_window.findChildren(QtWidgets.QWidget, TOOL_OBJECT_NAME):
             try:
-                if hasattr(child, 'controller') and hasattr(child.controller, 'cleanup'):
+                if hasattr(child, 'controller'):
                     child.controller.cleanup()
                 child.close()
                 child.deleteLater()
@@ -51,30 +50,25 @@ def run():
             except Exception as e:
                 print(f"既存ウィンドウのクローズに失敗しました: {e}")
 
-        # 各モジュールをリロード (依存関係の末端から)
+        # 依存関係の末端から順にリロード
         importlib.reload(scene_query)
         importlib.reload(model)
         importlib.reload(view)
         importlib.reload(controller)
         
-        # --- ここから修正箇所 ---
-        # 実際のファイル構成に合わせてインスタンス化処理を修正
-        
-        # View(UI)のインスタンスを作成
+        # ViewとControllerをインスタンス化して接続
         app_view = view.RenderLayerToolView(parent=main_window)
         app_view.setObjectName(TOOL_OBJECT_NAME)
-
-        # ControllerにViewを渡してインスタンスを作成
+        
+        # ControllerにViewのインスタンスを渡す
         app_controller = controller.RenderLayerToolController(view_instance=app_view)
         
-        # ViewからControllerにアクセスできるように参照を保持
+        # ViewからControllerにアクセスできるように参照を保持（任意）
         app_view.controller = app_controller
         _tool_instance = app_controller
 
-        # UIを表示
         app_view.show()
         print("Render Layer Tool (Rebuilt) started successfully.")
-        # --- 修正箇所ここまで ---
 
     except Exception as e:
         error_message = f"ツールの起動に失敗しました: {e}"
@@ -85,3 +79,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
