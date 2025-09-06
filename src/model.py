@@ -32,6 +32,11 @@ class RenderLayerManager:
             "Clear": []
         }
 
+    def reset(self):
+        """Render Setupインスタンスへの参照を再取得して、内部状態をリフレッシュする。"""
+        self.rs_instance = rs.instance()
+        log.info("RenderLayerManager state has been reset.")
+
     def get_aov_preset(self, preset_name):
         return self.AOV_PRESETS.get(preset_name, [])
 
@@ -60,15 +65,18 @@ class RenderLayerManager:
         
         layers_to_create_info = []
 
+        # --- Target レイヤーの作成ジョブを生成 ---
         if target_list:
             if create_each:
                 for obj in target_list:
                     layer_name = self._sanitize_name(obj)
-                    layers_to_create_info.append({'name': layer_name, 'targets': [obj], 'pvoffs': []})
+                    layers_to_create_info.append({'name': layer_name, 'targets': [obj], 'pvoffs': pvoff_list})
             else:
                 layer_name = self._sanitize_name(base_name or target_list[0])
-                layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': []})
-
+                layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': pvoff_list})
+        
+        # --- PVOff レイヤーの作成ジョブを生成 ---
+        # 【バグ修正】Targetリストの状態に関わらず、PVOffリストに項目があれば常に実行する
         if pvoff_list:
             layer_name = self._sanitize_name((base_name or "Scene") + "_PVOff")
             layers_to_create_info.append({'name': layer_name, 'targets': target_list, 'pvoffs': pvoff_list})
@@ -76,6 +84,7 @@ class RenderLayerManager:
         if not layers_to_create_info:
             return 0
 
+        # --- 生成されたジョブリストを元にレイヤーを実際に作成 ---
         existing_layer_names = set(self.list_render_layers())
         created_count = 0
         try:
@@ -122,20 +131,17 @@ class RenderLayerManager:
             valid_targets = [obj for obj in target_objects if cmds.objExists(obj)]
             valid_pvoffs = [obj for obj in pvoff_objects if cmds.objExists(obj)]
             
-            # 【ロジック逆転】レイヤー名に「_PVOff」が含まれるかで挙動を切り替える
             is_pvoff_layer = "_PVOff" in layer_name
 
             if valid_targets:
                 target_col = layer.createCollection(f"COL_{layer_name}_Target")
                 target_col.getSelector().staticSelection.set(valid_targets)
-                # PVOffレイヤーの場合、TargetのPVはOFFにする。それ以外はON。
                 target_enabled = False if is_pvoff_layer else True
                 self._apply_pv_override_by_shape(target_col, enabled=target_enabled)
 
             if valid_pvoffs:
                 pvoff_col = layer.createCollection(f"COL_{layer_name}_PVOff")
                 pvoff_col.getSelector().staticSelection.set(valid_pvoffs)
-                # PVOffレイヤーの場合、PVOffリストのPVはONにする。それ以外はOFF。
                 pvoff_enabled = True if is_pvoff_layer else False
                 self._apply_pv_override_by_shape(pvoff_col, enabled=pvoff_enabled)
             
@@ -147,10 +153,6 @@ class RenderLayerManager:
             return False
 
     def _apply_pv_override_by_shape(self, collection, enabled=True):
-        """
-        手動操作を模倣し、コレクション内の各オブジェクトのシェイプに対して
-        直接Absolute Overrideを作成し、Primary VisibilityをON/OFFする。
-        """
         try:
             transform_nodes = list(collection.getSelector().staticSelection)
             status = "ON" if enabled else "OFF"
@@ -167,23 +169,17 @@ class RenderLayerManager:
                         log.warning(f"Skipping '{shape}' as it has no 'primaryVisibility' attribute.")
                         continue
                     
-                    log.info(f"  Creating AbsoluteOverride for '{shape}.primaryVisibility'")
                     abs_ovr = collection.createAbsoluteOverride(shape, 'primaryVisibility')
-                    
                     if abs_ovr:
                         try:
                             value = 1 if enabled else 0
                             abs_ovr.setAttrValue(value)
-                            log.info(f"    Successfully set override value to {value} for '{shape}'")
                         except Exception:
-                            log.warning(f"    'setAttrValue' failed. Falling back to cmds.setAttr for '{shape}'")
                             override_node_name = abs_ovr.name()
                             attribute_plug = f"{override_node_name}.attrValue"
                             cmds.setAttr(attribute_plug, value)
-                            log.info(f"    Successfully set override value via cmds.setAttr for '{shape}'")
                     else:
                         log.error(f"    Failed to create AbsoluteOverride for '{shape}'")
-
         except Exception as e:
             log.error(f"PV overrideの適用中に予期せぬエラー: {e} @ {collection.name()}")
             traceback.print_exc()

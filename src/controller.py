@@ -1,8 +1,5 @@
 # render_layer_tool/controller.py
 # -*- coding: utf-8 -*-
-"""
-ViewとModelを仲介し、アプリケーションのロジックを制御するコントローラー。
-"""
 import maya.cmds as cmds
 from maya.api import OpenMaya as om
 from PySide6 import QtWidgets, QtCore
@@ -11,9 +8,6 @@ import model
 import scene_query
 
 class RenderLayerToolController:
-    """
-    UIからのイベントを処理し、モデルとビューを更新する。
-    """
     def __init__(self, view_instance):
         self.view = view_instance
         self.model = model.RenderLayerManager()
@@ -26,14 +20,12 @@ class RenderLayerToolController:
         self.refresh_render_layer_list()
 
     def cleanup(self):
-        """ツール終了時にコールバックをクリーンアップする。"""
         if self._callback_ids:
             om.MMessage.removeCallbacks(self._callback_ids)
             self._callback_ids = []
             print("Maya Callbacks removed.")
 
     def _connect_signals(self):
-        """ViewからのシグナルをControllerのスロットに接続する。"""
         self.view.request_populate_tree.connect(self.populate_scene_tree)
         self.view.request_add_to_target.connect(self._add_selected_to_list)
         self.view.request_remove_from_target.connect(self._remove_selected_from_list)
@@ -47,7 +39,6 @@ class RenderLayerToolController:
         self.view.selected_layers_changed.connect(self.update_layer_contents_view)
 
     def _setup_maya_callbacks(self):
-        """Mayaシーンの変更を検知してUIを自動更新するコールバックを設定する。"""
         self.cleanup()
         
         dag_callback = om.MDGMessage.addNodeAddedCallback(self._on_scene_changed, "transform")
@@ -111,7 +102,6 @@ class RenderLayerToolController:
         self.view.set_status("選択したオブジェクトをリストから削除しました。")
 
     def create_render_layer(self):
-        """Viewから設定を取得し、レンダーレイヤーを作成する。"""
         base_name = self.view.layer_name_le.text()
         
         target_list = [self.view.target_list_widget.item(i).text() for i in range(self.view.target_list_widget.count())]
@@ -128,7 +118,6 @@ class RenderLayerToolController:
 
         try:
             cmds.undoInfo(openChunk=True)
-            # 【ロジック変更】Modelに全ての情報を渡し、レイヤー作成を依頼する
             created_count = self.model.create_layers_from_lists(
                 base_name=base_name,
                 target_list=target_list,
@@ -172,6 +161,10 @@ class RenderLayerToolController:
         try:
             cmds.undoInfo(openChunk=True)
             deleted_count = self.model.delete_multiple_layers(layer_names)
+            
+            # 【修正】削除後にモデルの状態をリセットして、Mayaの内部状態との同期を確実にする
+            self.model.reset()
+            
             self.view.set_status(f"{deleted_count}個のレイヤーを削除しました。")
             self.refresh_render_layer_list()
         except Exception as e:
@@ -195,6 +188,10 @@ class RenderLayerToolController:
         try:
             cmds.undoInfo(openChunk=True)
             deleted_count = self.model.delete_multiple_layers(all_layers)
+
+            # 【修正】削除後にモデルの状態をリセットして、Mayaの内部状態との同期を確実にする
+            self.model.reset()
+
             self.view.set_status(f"{deleted_count}個のレイヤーを全て削除しました。")
             self.refresh_render_layer_list()
         except Exception as e:
